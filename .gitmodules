@@ -1,0 +1,6 @@
+[submodule "xen"]
+	path = xen
+	url = https://xenbits.xen.org/git-http/xen.git
+[submodule "netmap"]
+	path = netmap
+	url = https://github.com/luigirizzo/netmap.git
