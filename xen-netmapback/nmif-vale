@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# Please make a link to /etc/xen/scripts 
+#
+
+dir=$(dirname "$0")
+. "$dir/xen-hotplug-common.sh"
+. "$dir/xen-network-common.sh"
+
+bridge=${bridge:-}
+bridge=$(xenstore_read_default "$XENBUS_PATH/bridge" "$bridge")
+
+findCommand "$@"
+evalVariables "$@"
+
+echo $XENBUS_PATH
+echo $type_if
+echo $command
+echo $bridge
+if [ "$type_if" = nmif -a "$command" = "online" ]
+then
+  echo "Success $nmif" # This nmif is set in netmapback driver
+  success
+fi
