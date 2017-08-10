@@ -1,0 +1,2798 @@
+From c1f4ba96f9f83af8c09fb60d519d0b3f42e293be Mon Sep 17 00:00:00 2001
+From: Kenichi Yasukata <kenichi.yasukata@neclab.eu>
+Date: Thu, 10 Aug 2017 09:10:55 +0100
+Subject: [PATCH 5/7] HyperNF patches
+
+---
+ xen/common/xennet/network.c       | 1013 ++++++++++++++++++++++++++++++++++
+ xen/common/xennet/vale.c          | 1095 +++++++++++++++++++++++++++++++++++++
+ xen/common/xennet/xennet_common.h |  655 ++++++++++++++++++++++
+ 3 files changed, 2763 insertions(+)
+ create mode 100644 xen/common/xennet/network.c
+ create mode 100644 xen/common/xennet/vale.c
+ create mode 100644 xen/common/xennet/xennet_common.h
+
+diff --git a/xen/common/xennet/network.c b/xen/common/xennet/network.c
+new file mode 100644
+index 0000000..0d83c52
+--- /dev/null
++++ b/xen/common/xennet/network.c
+@@ -0,0 +1,1013 @@
++/*
++ *
++ * Copyright (c) 2016-2017, NEC Europe Ltd., NEC Corporation All rights reserved.
++ *
++ * Authors: Kenichi Yasukata
++ *
++ */
++
++#include "xennet_common.h"
++
++struct network_info *ninfo;
++
++static int find_free_if_entry(void)
++{
++	int i;
++	for (i = 0; i < XENNET_MAX_IF; i++) {
++		if (ninfo->nmifs[i] == NULL)
++			return i;
++	}
++	return -EFAULT;
++}
++
++struct netmapif *get_nmif_by_id(int id)
++{
++	struct netmapif *nmif;
++
++	if (id < 0 || id >= XENNET_MAX_IF) {
++		XD("invald nmif id %d", id);
++		return NULL;
++	}
++
++	nmif = ninfo->nmifs[id];
++
++	return nmif;
++}
++
++static void nmif_exit(int id)
++{
++	struct netmapif *nmif;
++
++	if (id < 0 || id >= XENNET_MAX_IF) {
++		XD("invalid id %d", id);
++		return;
++	}
++
++	nmif = ninfo->nmifs[id];
++	if (!nmif) {
++		XD("no nmif for %d", id);
++		return;
++	}
++
++	if (nmif->backend_d) {
++		put_domain(nmif->backend_d);
++		nmif->backend_d = NULL;
++	}
++
++	if (nmif->d) {
++		put_domain(nmif->d);
++		nmif->d = NULL;
++	}
++
++	ninfo->nmifs[id] = NULL;
++	xfree(nmif);
++}
++
++static struct netmapif *nmif_init(int id, domid_t dom, domid_t backend_dom)
++{
++	struct netmapif *nmif;
++	struct domain *d, *be_d;
++
++	if (id < 0 || id >= XENNET_MAX_IF) {
++		XD("invalid id %d", id);
++		return NULL;
++	}
++
++	be_d = get_domain_by_id(backend_dom);
++	if (!be_d) {
++		XD("invalid backend domain %d", backend_dom);
++		goto out;
++	}
++
++	d = get_domain_by_id(dom);
++	if (!d) {
++		XD("invalid domain %d", dom);
++		goto out0;
++	}
++
++	nmif = xzalloc(struct netmapif);
++	if (!nmif) {
++		XD("failed to alloc nmif");
++		goto out1;
++	}
++
++	XD("register %d, dom %d, backend %d", id, dom, backend_dom);
++	nmif->id = id;
++	nmif->d = d;
++	nmif->backend_d = be_d;
++	nmif->retry = 1;
++
++	return nmif;
++out1:
++	put_domain(d);
++out0:
++	put_domain(be_d);
++out:
++	return NULL;
++}
++
++static int network_mem_op_unmap_i40e_objoff(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		return -EINVAL;
++	}
++
++	ret = unmap_i40e_hwobj(op, nmif);
++
++	return ret;
++}
++
++static int network_mem_op_map_i40e_objoff(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		return -EINVAL;
++	}
++
++	ret = map_i40e_hwobj(op, nmif);
++
++	return ret;
++}
++
++static int network_mem_op_unmap_i40e(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		return -EINVAL;
++	}
++
++	ret = unmap_i40e(op, nmif);
++
++	return ret;
++}
++
++static int network_mem_op_map_i40e(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int ret = 0, i;
++	struct netmap_kring *kring;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		return -EINVAL;
++	}
++
++	ret = map_i40e(op, nmif);
++
++	for (i = 0; i < nmif->num_tx_rings; i++) {
++		kring = nmif->tx_rings[i];
++		kring->xen_nm_sync = i40e_netmap_txsync;
++	}
++	for (i = 0; i < nmif->num_rx_rings; i++) {
++		kring = nmif->rx_rings[i];
++		kring->xen_nm_sync = i40e_netmap_rxsync;
++	}
++
++	return ret;
++}
++
++static void network_mem_op_unmap_netmap(struct xennet_mem_op *op)
++{
++	spin_lock(&ninfo->nmifs_lock);
++	nmif_exit(op->id);
++	spin_unlock(&ninfo->nmifs_lock);
++}
++
++void *network_iomem_map_frames(xennet_mem_op_t *op)
++{
++	void *ptr = NULL;
++
++	ptr = ioremap(op->pa, op->len);
++	if (!ptr) {
++		XD("failed ioremap");
++	}
++
++	return ptr;
++}
++
++void *network_map_frames(xennet_mem_op_t *op)
++{
++	struct domain *d;
++	struct page_info *page;
++	int i, ret;
++	void *mem = NULL;
++	unsigned long *frames;
++	mfn_t *mfn;
++	p2m_type_t p2mt;
++
++	ND("nr_frame %u", op->nr_frames);
++
++	if ( !guest_handle_okay(op->frame_list, op->nr_frames) ) {
++		XD("handle failed");
++		ret = -EFAULT;
++		goto out;
++	}
++
++	frames = xzalloc_array(unsigned long, op->nr_frames);
++	if (frames == NULL) {
++		XD("failed to alloc %u frames", op->nr_frames);
++		ret = -ENOMEM;
++		goto out;
++	};
++
++	if ( copy_from_guest(frames, op->frame_list, op->nr_frames) ) {
++		XD("failed to copy frame list");
++		ret = -EFAULT;
++		goto out0;
++	}
++
++	mfn = xzalloc_array(mfn_t, op->nr_frames);
++	if (mfn == NULL) {
++		XD("failed to alloc %u mfn", op->nr_frames);
++		ret = -ENOMEM;
++		goto out0;
++	};
++
++	d = rcu_lock_domain_by_any_id(op->dom);
++	if (d == NULL) {
++		XD("Bad domain %d", op->dom);
++		op->status = XENNET_bad_domain;
++		goto out1;
++	}
++
++	for (i = 0; i < op->nr_frames; i++) {
++		page = get_page_from_gfn(d, frames[i], &p2mt, P2M_ALLOC);
++		if (!page) {
++			XD("This is invalid gfn %lx", frames[i]);
++			rcu_unlock_domain(d);
++			goto out1;
++		}
++		mfn[i] = _mfn(page_to_mfn(page));
++		//XD("gfn:%lu, mfn:0x%lx", frames[i], mfn[i]);
++	}
++
++	rcu_unlock_domain(d);
++
++	mem = vmap(mfn, op->nr_frames);
++	ND("vmap %p", mem);
++	if (mem == NULL) {
++		XD("failed to vmap");
++		ret = -EFAULT;
++		goto out1;
++	}
++
++out1:
++	xfree(mfn);
++out0:
++	xfree(frames);
++out:
++	if (mem)
++		return mem;
++	else
++		return ERR_PTR(ret);
++}
++
++static int network_mem_op_map_netmap(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int id, ret = INVALID_IF_ID;
++
++	spin_lock(&ninfo->nmifs_lock);
++
++	if ((id = find_free_if_entry()) >= 0) {
++		nmif = nmif_init(id, op->target_dom, op->dom);
++		if (!nmif) {
++			XD("failed to setup nmif");
++			spin_unlock(&ninfo->nmifs_lock);
++			goto out0;
++		}
++		ninfo->nmifs[id] = nmif;
++		op->id = id;
++	}
++
++	ret = id;
++
++	spin_unlock(&ninfo->nmifs_lock);
++
++	return ret;
++out0:
++	network_mem_op_unmap_netmap(op);
++	return ret;
++}
++
++static int network_mem_op_unmap_kring_objoff(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	struct netmap_kring *kring;
++	int i, ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++#define VUNMAP_OBJ(objname) \
++	do {							\
++		vunmap_addr((unsigned long) kring->objname);	\
++		ND("vunmap %s", ""#objname"");			\
++		kring->objname = NULL;				\
++	} while (0)
++
++	for (i = 0; i < nmif->num_tx_rings; i++) {
++		kring = nmif->tx_rings[i];
++		VUNMAP_OBJ(xen_nkr_ft);
++		VUNMAP_OBJ(xen_nkr_leases);
++	}
++
++	for (i = 0; i < nmif->num_rx_rings; i++) {
++		kring = nmif->rx_rings[i];
++		VUNMAP_OBJ(xen_nkr_ft);
++		VUNMAP_OBJ(xen_nkr_leases);
++	}
++
++#undef VUNMAP_OBJ
++out:
++	return 0;
++}
++
++static int network_mem_op_map_kring_objoff(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	struct netmap_kring *kring;
++	void *objptr;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if ((enum txrx) op->op2 == NR_TX) {
++		kring = nmif->tx_rings[op->id2];
++		ND("tx kring %d, %u", kring->ring_id, kring->nkr_num_slots);
++	} else if ((enum txrx) op->op2 == NR_RX) {
++		kring = nmif->rx_rings[op->id2];
++		ND("rx kring %d, %u", kring->ring_id, kring->nkr_num_slots);
++	} else {
++		XD("unknow tx/rx option %d", op->op);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	objptr = network_map_frames(op) + op->pgoff;
++	if (IS_ERR(objptr)) {
++		XD("failed to map objoff");
++		ret = PTR_ERR(objptr);
++		goto out;
++	}
++
++#define SET_VAL(objname) \
++	if (op->objoff == offsetof(struct netmap_kring, objname)) {	\
++		kring->objname = objptr;				\
++		ND("set val %s", ""#objname"");				\
++		goto out;						\
++	}
++
++	SET_VAL(xen_ring);
++	SET_VAL(xen_nkr_ft);
++	SET_VAL(xen_nkr_leases);
++#undef SET_VAL
++
++	XD("no such object %lu", op->objoff);
++	ret = -EINVAL;
++out:
++	return ret;
++}
++
++static void network_mem_op_unmap_kring(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	struct netmap_kring *kring;
++	int i;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		return;
++	}
++
++	if (nmif->tx_rings) {
++		for (i = 0; i < nmif->num_tx_rings; i++) {
++			kring = nmif->tx_rings[i];
++			if (kring) {
++				kring->xen_domain = NULL;
++				kring->xen_nm_sync = NULL;
++				kring->xen_nm_notify = NULL;
++				kring->xen_vp_sync = NULL;
++				ND("vunmap tx kring[%d] %p", i, kring);
++				vunmap_addr((unsigned long) kring);
++				nmif->tx_rings[i] = NULL;
++			}
++		}
++	}
++	xfree(nmif->tx_rings);
++
++	if (nmif->rx_rings) {
++		for (i = 0; i < nmif->num_rx_rings; i++) {
++			kring = nmif->rx_rings[i];
++			if (kring) {
++				kring->xen_domain = NULL;
++				kring->xen_nm_sync = NULL;
++				kring->xen_nm_notify = NULL;
++				kring->xen_vp_sync = NULL;
++				ND("vunmap rx kring[%d] %p", i, kring);
++				vunmap_addr((unsigned long) kring);
++				nmif->rx_rings[i] = NULL;
++			}
++		}
++	}
++	xfree(nmif->rx_rings);
++}
++
++static int network_mem_op_map_kring(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	struct netmap_kring *kring;
++	uint16_t num_rings;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	num_rings = op->op2;
++	if (!num_rings) {
++		XD("number of total rings are not set");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	kring = network_map_frames(op) + op->pgoff;
++	if (IS_ERR(kring)) {
++		XD("failed to map kring");
++		ret = PTR_ERR(kring);
++		goto out;
++	}
++
++	if (kring->tx == NR_TX) {
++		if (!nmif->tx_rings) {
++			nmif->tx_rings = xzalloc_array(struct netmap_kring *,
++						       num_rings);
++			if (!nmif->tx_rings) {
++				XD("failed to alloc nmif->tx_rings");
++				goto out0;
++			}
++			nmif->num_tx_rings = num_rings;
++		}
++		nmif->tx_rings[kring->ring_id] = kring;
++		kring->nmif = nmif;
++		if (!kring->xen_nm_sync)
++			kring->xen_nm_sync = netmap_xp_txsync;
++		if (!kring->xen_nm_notify)
++			kring->xen_nm_notify = xennet_netmap_notify;
++		kring->xen_vp_sync = netmap_xp_txsync;
++		kring->xen_domain = nmif->backend_d;
++		XD("tx kring %p off:%lx %d:%d", kring, op->pgoff, kring->ring_id, kring->nkr_num_slots);
++	} else if (kring->tx == NR_RX) {
++		if (!nmif->rx_rings) {
++			nmif->rx_rings = xzalloc_array(struct netmap_kring *,
++						       num_rings);
++			if (!nmif->rx_rings) {
++				XD("failed to alloc nmif->tx_rings");
++				goto out0;
++			}
++			nmif->num_rx_rings = num_rings;
++		}
++		nmif->rx_rings[kring->ring_id] = kring;
++		kring->nmif = nmif;
++		if (!kring->xen_nm_sync)
++			kring->xen_nm_sync = netmap_xp_rxsync;
++		if (!kring->xen_nm_notify)
++			kring->xen_nm_notify = xennet_netmap_notify;
++		kring->xen_vp_sync = netmap_xp_rxsync;
++		kring->xen_domain = nmif->backend_d;
++		XD("rx kring %p off:%lx %d:%d", kring, op->pgoff, kring->ring_id, kring->nkr_num_slots);
++	} else {
++		XD("unknown ring tx/rx type");
++		goto out0;
++	}
++
++	return ret;
++out0:
++	network_mem_op_unmap_kring(op);
++out:
++	return ret;
++}
++
++static int network_mem_op_unbind_hwsw(xennet_mem_op_t *op)
++{
++	struct netmapif *hwnmif, *swnmif;
++	struct netmap_kring *kring;
++	int ret = 0, i;
++
++	hwnmif = get_nmif_by_id(op->id);
++	if (!hwnmif) {
++		XD("no hwnmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	swnmif = get_nmif_by_id(op->id2);
++	if (!swnmif) {
++		XD("no swnmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (hwnmif->swnmif != swnmif) {
++		XD("Invalid requiest, h-s %p s %p",
++				hwnmif->swnmif,
++				swnmif);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (swnmif->hwnmif != hwnmif) {
++		XD("Invalid requiest, s-h %p h %p",
++				swnmif->hwnmif,
++				hwnmif);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	hwnmif->swnmif = NULL;
++	swnmif->hwnmif = NULL;
++	for (i = 0; i < swnmif->num_rx_rings; i++) {
++		kring = swnmif->rx_rings[i];
++		kring->xen_nm_notify = xennet_netmap_notify;
++	}
++out:
++	return 0;
++}
++
++static int network_mem_op_bind_hwsw(xennet_mem_op_t *op)
++{
++	struct netmapif *hwnmif, *swnmif;
++	struct domain *d;
++	struct netmap_kring *kring;
++	int ret = 0, i;
++
++	d = get_domain_by_id(op->target_dom);
++	if (!d) {
++		XD("invalid domain id %d", op->target_dom);
++		ret = -EINVAL;
++		goto out;
++	}
++	put_domain(d);
++
++	hwnmif = get_nmif_by_id(op->id);
++	if (!hwnmif) {
++		XD("no hwnmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	swnmif = get_nmif_by_id(op->id2);
++	if (!swnmif) {
++		XD("no swnmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (hwnmif->hwnmif != NULL || hwnmif->swnmif != NULL
++			|| swnmif->hwnmif != NULL || swnmif->swnmif) {
++		XD("Already bound to somewhere, h-h %p, h-s %p, s-h %p, s-s %p",
++				hwnmif->hwnmif,
++				hwnmif->swnmif,
++				swnmif->hwnmif,
++				swnmif->swnmif);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	hwnmif->swnmif = swnmif;
++	swnmif->hwnmif = hwnmif;
++	for (i = 0; i < hwnmif->num_rx_rings; i++) {
++		kring = hwnmif->rx_rings[i];
++		ND("Set bwrap intr notify %d", i);
++		kring->xen_nm_notify = netmap_bwrap_intr_notify;
++	}
++	for (i = 0; i < swnmif->num_rx_rings; i++) {
++		kring = swnmif->rx_rings[i];
++		ND("Set bwrap notify %d", i);
++		kring->xen_nm_notify = netmap_bwrap_notify;
++	}
++out:
++	return 0;
++}
++
++static int network_mem_op_bdg_detach(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (nmif->bdg_port && nmif->na_bdg)
++		nmif->na_bdg->xen_bdg_ports[*nmif->bdg_port] = NULL;
++
++#define VUNMAP_OBJ(objname) \
++	do {						    \
++		vunmap_addr((unsigned long) nmif->objname); \
++		ND("vunmap %s", ""#objname"");			\
++		nmif->objname = NULL;			    \
++	} while (0)
++
++	VUNMAP_OBJ(na_bdg);
++#undef VUNMAP_OBJ
++out:
++	return 0;
++}
++
++static void unmap_netmap_packet_buffer(struct lut_entry *lut, int objtotal)
++{
++	int i;
++	void *addr;
++
++	addr = lut[0].xvaddr;
++
++	for (i = 0; i < objtotal; i++) {
++		lut[i].gfn = 0;
++		lut[i].xvaddr = NULL;
++	}
++
++	vunmap(addr);
++}
++
++static int network_mem_op_unmap_nmif_objoff(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++#define VUNMAP_OBJ(objname) \
++	do {						    \
++		vunmap_addr((unsigned long) nmif->objname); \
++		ND("vunmap %s", ""#objname"");			\
++		nmif->objname = NULL;			    \
++	} while (0)
++
++
++	VUNMAP_OBJ(na_bdg);
++	VUNMAP_OBJ(up_na_flags);
++	VUNMAP_OBJ(last_smac);
++	VUNMAP_OBJ(bdg_port);
++	VUNMAP_OBJ(mfs);
++	VUNMAP_OBJ(up_virt_hdr_len);
++	VUNMAP_OBJ(nm_buf_size);
++	if (nmif->xen_lut) {
++		int objtotal;
++		if (!nmif->nm_objtotal)
++			objtotal = 0;
++		else
++			objtotal = *nmif->nm_objtotal;
++		unmap_netmap_packet_buffer(nmif->xen_lut, objtotal);
++	}
++	VUNMAP_OBJ(xen_lut);
++	VUNMAP_OBJ(nm_objtotal);
++#undef VUNMAP_OBJ
++out:
++	return 0;
++}
++
++static int map_netmap_packet_buffer(struct xennet_mem_op *op,
++				    struct lut_entry *lut,
++				    uint32_t objtotal,
++				    uint32_t objsize)
++{
++	struct domain *d;
++	uint32_t i, ret = 0, cnt;
++	struct page_info *page;
++	p2m_type_t p2mt;
++	mfn_t *mfns;
++	pfn_t prev_gfn = -1;
++	void *addr;
++
++	mfns = xzalloc_array(mfn_t, objtotal);
++	if (!mfns) {
++		XD("failed to alloc mfns");
++		ret = -ENOMEM;
++		goto out0;
++	}
++
++	d = rcu_lock_domain_by_any_id(op->dom);
++	if (d == NULL) {
++		XD("Bad domain %d", op->dom);
++		op->status = XENNET_bad_domain;
++		ret = -EINVAL;
++		goto out1;
++	}
++
++	for (i = 0, cnt = 0; i < objtotal; i++) {
++		if (lut[i].xvaddr) {
++			XD("This lut is registered");
++			ret = 0;
++			goto out2;
++		}
++		if (lut[i].gfn == 0) {
++			XD("gfn has 0, weird");
++		}
++
++		if (prev_gfn == lut[i].gfn)
++			continue;
++
++		page = get_page_from_gfn(d, lut[i].gfn, &p2mt, P2M_ALLOC);
++		if (!page) {
++			XD("This is invalid gfn %lx", lut[i].gfn);
++			ret = -EINVAL;
++			goto out2;
++		}
++		mfns[cnt] = _mfn(page_to_mfn(page));
++		prev_gfn = lut[i].gfn;
++		cnt++;
++	}
++
++	addr = vmap(mfns, cnt);
++	if (!addr) {
++		XD("failed to vmap");
++		ret = -ENOMEM;
++		goto out2;
++	}
++
++	for (i = 0; i < objtotal; i++) {
++		lut[i].xvaddr = addr + (objsize * i);
++	}
++
++	XD("packet buffer is mapped : size %u, num %u", objsize, objtotal);
++out2:
++	rcu_unlock_domain(d);
++out1:
++	xfree(mfns);
++out0:
++	return ret;
++}
++
++static int network_mem_op_map_nmif_objoff(xennet_mem_op_t *op)
++{
++	struct netmapif *nmif = NULL;
++	void *objptr;
++	int ret = 0;
++
++	nmif = get_nmif_by_id(op->id);
++	if (!nmif) {
++		XD("no nmif for %d", op->id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	objptr = network_map_frames(op) + op->pgoff;
++	if (IS_ERR(objptr)) {
++		XD("failed to map objoff");
++		ret = PTR_ERR(objptr);
++		goto out;
++	}
++
++#define SET_VAL(objname) \
++	if (op->objoff == offsetof(struct netmapif, objname)) {		\
++		nmif->objname = objptr;					\
++		ND("set val %s", ""#objname"");				\
++		goto out;						\
++	}
++
++	SET_VAL(na_bdg);
++	SET_VAL(up_na_flags);
++	SET_VAL(last_smac);
++	SET_VAL(bdg_port);
++	SET_VAL(mfs);
++	SET_VAL(up_virt_hdr_len);
++	SET_VAL(nm_buf_size);
++	SET_VAL(nm_objtotal);
++	SET_VAL(xen_lut);
++#undef SET_VAL
++
++	XD("no such object %lu", op->objoff);
++	ret = -EINVAL;
++out:
++	if (op->objoff == offsetof(struct netmapif, na_bdg)
++			|| op->objoff == offsetof(struct netmapif, bdg_port)) {
++		if (nmif->na_bdg && nmif->bdg_port) {
++			if (!nmif->na_bdg->xen_bdg_ops.lookup)
++				nmif->na_bdg->xen_bdg_ops.lookup = netmap_bdg_learning;
++
++			XD("if %d is attached to port %d",
++					nmif->id, *nmif->bdg_port);
++			nmif->na_bdg->xen_bdg_ports[*nmif->bdg_port] = nmif;
++		}
++	}
++
++	if ((op->objoff == offsetof(struct netmapif, xen_lut))
++			|| (op->objoff == offsetof(struct netmapif, nm_objtotal))
++			|| (op->objoff == offsetof(struct netmapif, nm_buf_size))) {
++		if ((nmif->xen_lut != NULL) && (nmif->nm_objtotal != NULL)
++				&& (nmif->nm_buf_size != NULL)) {
++			if ((ret = map_netmap_packet_buffer(op, nmif->xen_lut,
++						*nmif->nm_objtotal, *nmif->nm_buf_size)) < 0) {
++				XD("failed to map packet buffer");
++			}
++		}
++	}
++	return ret;
++}
++
++static int network_mem_op(XEN_GUEST_HANDLE_PARAM(xennet_mem_op_t) uop, unsigned int count)
++{
++	struct xennet_mem_op op;
++	int ret = INVALID_IF_ID;
++
++	if ( unlikely(copy_from_guest(&op, uop, 1) != 0) ) {
++		XD("failed copy from user");
++		ret = -EFAULT;
++		goto out;
++	}
++
++	switch (op.op) {
++		case XENNETOP_MEM_map_netmap:
++			ret = network_mem_op_map_netmap(&op);
++			break;
++		case XENNETOP_MEM_unmap_netmap:
++			network_mem_op_unmap_netmap(&op);
++			ret = 0;
++			break;
++		case XENNETOP_MEM_map_kring:
++			ret = network_mem_op_map_kring(&op);
++			break;
++		case XENNETOP_MEM_unmap_kring:
++			network_mem_op_unmap_kring(&op);
++			ret = 0;
++			break;
++		case XENNETOP_MEM_map_nmif_objoff:
++			ret = network_mem_op_map_nmif_objoff(&op);
++			break;
++		case XENNETOP_MEM_unmap_nmif_objoff:
++			network_mem_op_unmap_nmif_objoff(&op);
++			ret = 0;
++			break;
++		case XENNETOP_MEM_map_kring_objoff:
++			ret = network_mem_op_map_kring_objoff(&op);
++			break;
++		case XENNETOP_MEM_unmap_kring_objoff:
++			network_mem_op_unmap_kring_objoff(&op);
++			ret = 0;
++			break;
++		//case XENNETOP_MEM_bdg_attach: // Reserved
++		//	break;
++		case XENNETOP_MEM_bdg_detach:
++			network_mem_op_bdg_detach(&op);
++			ret = 0;
++			break;
++		case XENNETOP_MEM_bind_hwsw:
++			ret = network_mem_op_bind_hwsw(&op);
++			break;
++		case XENNETOP_MEM_unbind_hwsw:
++			ret = network_mem_op_unbind_hwsw(&op);
++			break;
++		case XENNETOP_MEM_map_i40e:
++			ret = network_mem_op_map_i40e(&op);
++			break;
++		case XENNETOP_MEM_unmap_i40e:
++			network_mem_op_unmap_i40e(&op);
++			ret = 0;
++			break;
++		case XENNETOP_MEM_map_i40e_objoff:
++			ret = network_mem_op_map_i40e_objoff(&op);
++			break;
++		case XENNETOP_MEM_unmap_i40e_objoff:
++			network_mem_op_unmap_i40e_objoff(&op);
++			ret = 0;
++			break;
++		default:
++			XD("unknown operation %d", op.op);
++			break;
++	}
++
++	if ( unlikely(__copy_to_guest(uop, &op, 1)) ) {
++		XD("Failed to copy to guest");
++		ret = -EFAULT;
++	}
++out:
++	return ret;
++}
++
++static long
++sync_op_netmap(unsigned int id, unsigned int op)
++{
++	int ret = 0;
++	struct netmapif *nmif;
++
++	nmif = get_nmif_by_id(id);
++	if (unlikely(!nmif)) {
++		XD("no nmif for %d", id);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (op == NR_TX) {
++		ret = netmap_tx(nmif);
++	} else if (op == NR_RX) {
++		ret = netmap_rx(nmif);
++	} else if (op == NR_TXRX) {
++		ret = netmap_tx(nmif);
++		ret = netmap_rx(nmif);
++	} else {
++		XD("unknown operation %d", op);
++		ret = -EINVAL;
++	}
++
++out:
++	return ret;
++}
++
++static int
++ctrl_op(XEN_GUEST_HANDLE_PARAM(xennet_ctrl_op_t) uop, unsigned int count)
++{
++	int ret = 0;
++	struct xennet_ctrl_op op;
++
++	if ( unlikely(copy_from_guest(&op, uop, 1) != 0) ) {
++		XD("failed copy from user"); ret = -EFAULT;
++		goto out;
++	}
++
++	switch (op.op) {
++		case XENNETOP_CTRL_SET_BDG_BATCH:
++			ret = netmap_set_bridge_batch(op.val1);
++			break;
++		case XENNETOP_CTRL_SET_DRVDOM_TXSYNC:
++			drvdom_txsync = op.val1;
++			if (drvdom_txsync) {
++				XD("Driver domain operates HW txsync");
++			} else {
++				XD("Xen operates HW txsync");
++			}
++			break;
++		default:
++			XD("Unknown ops %d", op.op);
++			break;
++	}
++out:
++	return ret;
++}
++
++long do_xennet_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) uop, unsigned int count, unsigned count2)
++{
++	long ret = 0;
++
++	switch (cmd) {
++		case XENNETOP_none:
++			break;
++		case XENNETOP_mem_netmap:
++			ret = network_mem_op(guest_handle_cast(uop, xennet_mem_op_t), count);
++			break;
++		case XENNETOP_sync:
++			ret = sync_op_netmap(count, count2);
++			break;
++		case XENNETOP_ctrl:
++			ret = ctrl_op(guest_handle_cast(uop, xennet_ctrl_op_t), count);
++			break;
++		default:
++			XD("no such command %d, ignored", cmd);
++	}
++
++	return ret;
++}
++
++static int __init xen_network_init(void)
++{
++	netmap_txsync_retry = NM_TXSYNC_RETRY;
++	ninfo = xzalloc(struct network_info);
++	spin_lock_init(&ninfo->nmifs_lock);
++	return 0;
++}
++__initcall(xen_network_init);
+diff --git a/xen/common/xennet/vale.c b/xen/common/xennet/vale.c
+new file mode 100644
+index 0000000..4c39223
+--- /dev/null
++++ b/xen/common/xennet/vale.c
+@@ -0,0 +1,1095 @@
++/*
++ *
++ * Copyright (c) 2016-2017, NEC Europe Ltd., NEC Corporation All rights reserved.
++ *
++ * Authors: Kenichi Yasukata
++ *
++ */
++
++#define __xennet__
++#include "xennet_common.h"
++
++int bridge_batch = NM_BDG_BATCH; /* bridge batch size */
++static int netmap_verbose = 0;
++int netmap_txsync_retry = 0;
++int drvdom_txsync = 0;
++
++void nm_kr_put(struct netmap_kring *kr)
++{
++	NM_ATOMIC_CLEAR(&kr->nr_busy);
++}
++
++int nm_kr_tryget(struct netmap_kring *kr, int can_sleep, int *perr)
++{
++	int busy = 1, stopped;
++	/* check a first time without taking the lock
++	 * to avoid starvation for nm_kr_get()
++	 */
++//retry:
++	stopped = kr->nkr_stopped;
++	if (unlikely(stopped)) {
++		goto stop;
++	}
++	busy = NM_ATOMIC_TEST_AND_SET(&kr->nr_busy);
++	/* we should not return NM_KR_BUSY if the ring was
++	 * actually stopped, so check another time after
++	 * the barrier provided by the atomic operation
++	 */
++	stopped = kr->nkr_stopped;
++	if (unlikely(stopped)) {
++		goto stop;
++	}
++
++	//if (unlikely(nm_iszombie(kr->na))) {
++	//	stopped = NM_KR_STOPPED;
++	//	goto stop;
++	//}
++
++	return unlikely(busy) ? NM_KR_BUSY : 0;
++
++stop:
++	if (!busy)
++		nm_kr_put(kr);
++	if (stopped == NM_KR_STOPPED) {
++/* if POLLERR is defined we want to use it to simplify netmap_poll().
++ * Otherwise, any non-zero value will do.
++ */
++#ifdef POLLERR
++#define NM_POLLERR POLLERR
++#else
++#define NM_POLLERR 1
++#endif /* POLLERR */
++		if (perr)
++			*perr |= NM_POLLERR;
++#undef NM_POLLERR
++	} else if (can_sleep) {
++		XD("can_sleep is not suppoerted");
++		//tsleep(kr, 0, "NM_KR_TRYGET", 4);
++		//goto retry;
++	}
++	return stopped;
++}
++
++static inline void
++pkt_copy(void *_src, void *_dst, int l)
++{
++	uint64_t *src = _src;
++	uint64_t *dst = _dst;
++	if (unlikely(l >= 1024)) {
++		memcpy(dst, src, l);
++		return;
++	}
++	for (; likely(l > 0); l-=64) {
++		*dst++ = *src++;
++		*dst++ = *src++;
++		*dst++ = *src++;
++		*dst++ = *src++;
++		*dst++ = *src++;
++		*dst++ = *src++;
++		*dst++ = *src++;
++		*dst++ = *src++;
++	}
++}
++
++static __inline uint32_t
++nm_bridge_rthash(const uint8_t *addr)
++{
++        uint32_t a = 0x9e3779b9, b = 0x9e3779b9, c = 0; // hask key
++
++        b += addr[5] << 8;
++        b += addr[4];
++        a += addr[3] << 24;
++        a += addr[2] << 16;
++        a += addr[1] << 8;
++        a += addr[0];
++
++        mix(a, b, c);
++#define BRIDGE_RTHASH_MASK	(NM_BDG_HASH-1)
++        return (c & BRIDGE_RTHASH_MASK);
++}
++
++#undef mix
++
++
++static inline void
++nm_sync_finalize(struct netmap_kring *kring)
++{
++	/*
++	 * Update ring tail to what the kernel knows
++	 * After txsync: head/rhead/hwcur might be behind cur/rcur
++	 * if no carrier.
++	 */
++	kring->xen_ring->tail = kring->rtail = kring->nr_hwtail;
++
++	//ND(5, "%s now hwcur %d hwtail %d head %d cur %d tail %d",
++	//	kring->name, kring->nr_hwcur, kring->nr_hwtail,
++	//	kring->rhead, kring->rcur, kring->rtail);
++}
++
++int
++netmap_ring_reinit(struct netmap_kring *kring)
++{
++	struct netmap_ring *ring = kring->xen_ring;
++	u_int lim = kring->nkr_num_slots - 1;
++	int errors = 0;
++
++	// XXX KASSERT nm_kr_tryget
++	//XD("called for %s", kring->name);
++	// XXX probably wrong to trust userspace
++	kring->rhead = ring->head;
++	kring->rcur  = ring->cur;
++	kring->rtail = ring->tail;
++
++	if (ring->cur > lim)
++		errors++;
++	if (ring->head > lim)
++		errors++;
++	if (ring->tail > lim)
++		errors++;
++	// FIXME: recover here
++	//for (i = 0; i <= lim; i++) {
++	//	u_int idx = ring->slot[i].buf_idx;
++	//	u_int len = ring->slot[i].len;
++	//	if (idx < 2 || idx >= kring->na->na_lut.objtotal) {
++	//		XD("bad index at slot %d idx %d len %d ", i, idx, len);
++	//		ring->slot[i].buf_idx = 0;
++	//		ring->slot[i].len = 0;
++	//	} else if (len > NETMAP_BUF_SIZE(kring->na)) {
++	//		ring->slot[i].len = 0;
++	//		XD("bad len at slot %d idx %d len %d", i, idx, len);
++	//	}
++	//}
++	if (errors) {
++		XD("total %d errors", errors);
++		//XD("%s reinit, cur %d -> %d tail %d -> %d",
++		//	kring->name,
++		//	ring->cur, kring->nr_hwcur,
++		//	ring->tail, kring->nr_hwtail);
++		ring->head = kring->rhead = kring->nr_hwcur;
++		ring->cur  = kring->rcur  = kring->nr_hwcur;
++		ring->tail = kring->rtail = kring->nr_hwtail;
++	}
++	return (errors ? 1 : 0);
++}
++
++static int
++netmap_xp_rxsync_locked(struct netmap_kring *kring, int flags)
++{
++	struct netmap_ring *ring = kring->xen_ring;
++	u_int nm_i, lim = kring->nkr_num_slots - 1;
++	u_int head = kring->rhead;
++	int n;
++
++	if (head > lim) {
++		XD("[%d] ouch dangerous reset!!!", kring->ring_id);
++		n = netmap_ring_reinit(kring);
++		goto done;
++	}
++
++	/* First part, import newly received packets. */
++	/* actually nothing to do here, they are already in the kring */
++
++	/* Second part, skip past packets that userspace has released. */
++	nm_i = kring->nr_hwcur;
++	if (nm_i != head) {
++		/* consistency check, but nothing really important here */
++		for (n = 0; likely(nm_i != head); n++) {
++			struct netmap_slot *slot = &ring->slot[nm_i];
++			//void *addr = NETMAP_BUF(ring, slot);
++
++			//if (addr == NETMAP_BUF_BASE(kring->na)) { /* bad buf */
++			//	D("bad buffer index %d, ignore ?",
++			//		slot->buf_idx);
++			//}
++			slot->flags &= ~NS_BUF_CHANGED;
++			nm_i = nm_next(nm_i, lim);
++		}
++		kring->nr_hwcur = head;
++	}
++
++	n = 0;
++done:
++	return n;
++}
++
++int
++netmap_xp_rxsync(struct netmap_kring *kring, int flags)
++{
++	int n;
++
++	mtx_lock(&kring->q_lock);
++	n = netmap_xp_rxsync_locked(kring, flags);
++	mtx_unlock(&kring->q_lock);
++	return n;
++}
++
++int
++netmap_bwrap_intr_notify(struct netmap_kring *kring, int flags)
++{
++	struct netmapif *nmif = kring->nmif;
++	struct netmapif *swnmif = nmif->swnmif;
++	struct netmap_kring *bkring;
++	u_int ring_nr = kring->ring_id;
++	int ret = NM_IRQ_COMPLETED;
++	int error;
++
++	bkring = swnmif->tx_rings[ring_nr];
++
++	/* make sure the ring is not disabled */
++	if (nm_kr_tryget(kring, 0 /* can't sleep */, NULL)) {
++		return EIO;
++	}
++
++	//if (netmap_verbose)
++	//    D("%s head %d cur %d tail %d",  na->name,
++	//	kring->rhead, kring->rcur, kring->rtail);
++
++	/* simulate a user wakeup on the rx ring
++	 * fetch packets that have arrived.
++	 */
++	error = kring->xen_nm_sync(kring, 0);
++	if (error)
++		goto put_out;
++	if (kring->nr_hwcur == kring->nr_hwtail) {
++		//XD("how strange, interrupt with no packets");
++		goto put_out;
++	}
++
++	/* new packets are kring->rcur to kring->nr_hwtail, and the bkring
++	 * had hwcur == bkring->rhead. So advance bkring->rhead to kring->nr_hwtail
++	 * to push all packets out.
++	 */
++	bkring->rhead = bkring->rcur = kring->nr_hwtail;
++
++	netmap_xp_txsync(bkring, flags);
++
++	/* mark all buffers as released on this ring */
++	kring->rhead = kring->rcur = kring->rtail = kring->nr_hwtail;
++	/* another call to actually release the buffers */
++	error = kring->xen_nm_sync(kring, 0);
++
++	/* The second rxsync may have further advanced hwtail. If this happens,
++	 *  return NM_IRQ_RESCHED, otherwise just return NM_IRQ_COMPLETED. */
++	if (kring->rcur != kring->nr_hwtail) {
++		ret = NM_IRQ_RESCHED;
++	}
++put_out:
++	nm_kr_put(kring);
++
++	return error ? error : ret;
++}
++
++int
++netmap_bwrap_notify(struct netmap_kring *kring, int flags)
++{
++	struct netmapif *nmif = kring->nmif;
++	struct netmapif *hwnmif = nmif->hwnmif;
++	u_int ring_n = kring->ring_id;
++	u_int lim = kring->nkr_num_slots - 1;
++	struct netmap_kring *hw_kring;
++	int error;
++
++	if (unlikely(!hwnmif)) {
++		XD("This virtual port doesn't have hwnmif");
++		return -EINVAL;
++	}
++
++	//ND("%s: na %s hwna %s", 
++	//		(kring ? kring->name : "NULL!"),
++	//		(na ? na->name : "NULL!"),
++	//		(hwna ? hwna->name : "NULL!"));
++	hw_kring = hwnmif->tx_rings[ring_n];
++
++	if (drvdom_txsync) {
++		hw_kring->xen_nm_sync(hw_kring, flags);
++		return NM_IRQ_COMPLETED;
++	}
++
++	if (nm_kr_tryget(hw_kring, 0, NULL)) {
++		return ENXIO;
++	}
++
++	/* first step: simulate a user wakeup on the rx ring */
++	netmap_xp_rxsync(kring, flags);
++	//ND("%s[%d] PRE rx(c%3d t%3d l%3d) ring(h%3d c%3d t%3d) tx(c%3d ht%3d t%3d)",
++	//	na->name, ring_n,
++	//	kring->nr_hwcur, kring->nr_hwtail, kring->nkr_hwlease,
++	//	ring->head, ring->cur, ring->tail,
++	//	hw_kring->nr_hwcur, hw_kring->nr_hwtail, hw_ring->rtail);
++	/* second step: the new packets are sent on the tx ring
++	 * (which is actually the same ring)
++	 */
++	hw_kring->rhead = hw_kring->rcur = kring->nr_hwtail;
++	error = hw_kring->xen_nm_sync(hw_kring, flags);
++	if (unlikely(error)) {
++		XD("xen_nm_sync failed %d", error);
++		goto put_out;
++	}
++
++	/* third step: now we are back the rx ring */
++	/* claim ownership on all hw owned bufs */
++	kring->rhead = kring->rcur = nm_next(hw_kring->nr_hwtail, lim); /* skip past reserved slot */
++
++	/* fourth step: the user goes to sleep again, causing another rxsync */
++	netmap_xp_rxsync(kring, flags);
++	//ND("%s[%d] PST rx(c%3d t%3d l%3d) ring(h%3d c%3d t%3d) tx(c%3d ht%3d t%3d)",
++	//	na->name, ring_n,
++	//	kring->nr_hwcur, kring->nr_hwtail, kring->nkr_hwlease,
++	//	ring->head, ring->cur, ring->tail,
++	//	hw_kring->nr_hwcur, hw_kring->nr_hwtail, hw_kring->rtail);
++put_out:
++	nm_kr_put(hw_kring);
++
++	return error ? error : NM_IRQ_COMPLETED;
++}
++
++int
++xennet_netmap_notify(struct netmap_kring *kring, int flags)
++{
++	int err;
++	//XD("called [%d] %d %d",
++	//		kring->xen_domain->domain_id,
++	//		kring->xen_irq2,
++	//		kring->evtchn_port);
++	if (likely(kring->xen_irq2)) {
++		if ((err = evtchn_send(kring->xen_domain, kring->evtchn_port)) < 0) {
++			XD("evtchn_send failed %d", err);
++		}
++	}
++	return 0;
++}
++
++u_int
++netmap_bdg_learning(struct nm_bdg_fwd *ft, uint8_t *dst_ring,
++		struct netmapif *nmif)
++{
++	uint8_t *buf = ft->ft_buf;
++	u_int buf_len = ft->ft_len;
++	struct nm_hash_ent *ht = nmif->na_bdg->ht;
++	uint32_t sh, dh;
++	u_int dst, mysrc = *nmif->bdg_port;
++	uint64_t smac, dmac;
++
++	/* safety check, unfortunately we have many cases */
++	if (buf_len >= 14 + *nmif->up_virt_hdr_len) {
++		/* virthdr + mac_hdr in the same slot */
++		buf += *nmif->up_virt_hdr_len;
++		buf_len -= *nmif->up_virt_hdr_len;
++	} else if (buf_len == *nmif->up_virt_hdr_len && ft->ft_flags & NS_MOREFRAG) {
++		/* only header in first fragment */
++		ft++;
++		buf = ft->ft_buf;
++		buf_len = ft->ft_len;
++	} else {
++		XD("invalid buf format, length %d", buf_len);
++		return NM_BDG_NOPORT;
++	}
++	dmac = le64toh(*(uint64_t *)(buf)) & 0xffffffffffff;
++	smac = le64toh(*(uint64_t *)(buf + 4));
++	smac >>= 16;
++
++	/*
++	 * The hash is somewhat expensive, there might be some
++	 * worthwhile optimizations here.
++	 */
++	if (((buf[6] & 1) == 0) && (*nmif->last_smac != smac)) { /* valid src */
++		uint8_t *s = buf+6;
++		sh = nm_bridge_rthash(s); // XXX hash of source
++		/* update source port forwarding entry */
++		*nmif->last_smac = ht[sh].mac = smac;	/* XXX expire ? */
++		ht[sh].ports = mysrc;
++		if (netmap_verbose)
++		    XD("src %02x:%02x:%02x:%02x:%02x:%02x on port %d",
++			s[0], s[1], s[2], s[3], s[4], s[5], mysrc);
++	}
++	dst = NM_BDG_BROADCAST;
++	if ((buf[0] & 1) == 0) { /* unicast */
++		dh = nm_bridge_rthash(buf); // XXX hash of dst
++		if (ht[dh].mac == dmac) {	/* found dst */
++			dst = ht[dh].ports;
++		}
++		/* XXX otherwise return NM_BDG_UNKNOWN ? */
++	}
++	return dst;
++}
++
++static inline uint32_t
++nm_kr_space(struct netmap_kring *k, int is_rx)
++{
++	int space;
++
++	if (is_rx) {
++		int busy = k->nkr_hwlease - k->nr_hwcur;
++		if (busy < 0)
++			busy += k->nkr_num_slots;
++		space = k->nkr_num_slots - 1 - busy;
++	} else {
++		/* XXX never used in this branch */
++		space = k->nr_hwtail - k->nkr_hwlease;
++		if (space < 0)
++			space += k->nkr_num_slots;
++	}
++#if 0
++	// sanity check
++	if (k->nkr_hwlease >= k->nkr_num_slots ||
++		k->nr_hwcur >= k->nkr_num_slots ||
++		k->nr_tail >= k->nkr_num_slots ||
++		busy < 0 ||
++		busy >= k->nkr_num_slots) {
++		D("invalid kring, cur %d tail %d lease %d lease_idx %d lim %d",			k->nr_hwcur, k->nr_hwtail, k->nkr_hwlease,
++			k->nkr_lease_idx, k->nkr_num_slots);
++	}
++#endif
++	return space;
++}
++
++static inline uint32_t
++nm_kr_lease(struct netmap_kring *k, u_int n, int is_rx)
++{
++	uint32_t lim = k->nkr_num_slots - 1;
++	uint32_t lease_idx = k->nkr_lease_idx;
++
++	k->xen_nkr_leases[lease_idx] = NR_NOSLOT;
++	k->nkr_lease_idx = nm_next(lease_idx, lim);
++
++	if (n > nm_kr_space(k, is_rx)) {
++		XD("invalid request for %d slots", n);
++		//panic("x");
++	}
++	/* XXX verify that there are n slots */
++	k->nkr_hwlease += n;
++	if (k->nkr_hwlease > lim)
++		k->nkr_hwlease -= lim + 1;
++
++	if (k->nkr_hwlease >= k->nkr_num_slots ||
++		k->nr_hwcur >= k->nkr_num_slots ||
++		k->nr_hwtail >= k->nkr_num_slots ||
++		k->nkr_lease_idx >= k->nkr_num_slots) {
++		XD("invalid kring, cur %d tail %d lease %d lease_idx %d lim %d",
++			//k->na->name,
++			k->nr_hwcur, k->nr_hwtail, k->nkr_hwlease,
++			k->nkr_lease_idx, k->nkr_num_slots);
++	}
++	return lease_idx;
++}
++
++static inline int
++nm_netmap_on(struct netmapif *nmif)
++{
++	return nmif && *nmif->up_na_flags & NAF_NETMAP_ON;
++}
++
++int
++nm_bdg_flush(struct nm_bdg_fwd *ft, u_int n, struct netmapif *nmif,
++		u_int ring_nr)
++{
++	struct nm_bdg_q *dst_ents, *brddst;
++	uint16_t num_dsts = 0, *dsts;
++	struct nm_bridge *b = nmif->na_bdg;
++	u_int i, me = *nmif->bdg_port;
++	/*
++	 * The work area (pointed by ft) is followed by an array of
++	 * pointers to queues , dst_ents; there are NM_BDG_MAXRINGS
++	 * queues per port plus one for the broadcast traffic.
++	 * Then we have an array of destination indexes.
++	 */
++	dst_ents = (struct nm_bdg_q *)(ft + NM_BDG_BATCH_MAX);
++	dsts = (uint16_t *)(dst_ents + NM_BDG_MAXPORTS * NM_BDG_MAXRINGS + 1);
++	/* first pass: find a destination for each packet in the batch */
++	for (i = 0; likely(i < n); i += ft[i].ft_frags) {
++		uint8_t dst_ring = ring_nr; /* default, same ring as origin */
++		uint16_t dst_port, d_i;
++		struct nm_bdg_q *d;
++
++		//ND("slot %d frags %d", i, ft[i].ft_frags);
++		/* Drop the packet if the virtio-net header is not into the first
++		   fragment nor at the very beginning of the second. */
++		if (unlikely(*nmif->up_virt_hdr_len > ft[i].ft_len))
++			continue;
++		dst_port = b->xen_bdg_ops.lookup(&ft[i], &dst_ring, nmif);
++		if (netmap_verbose > 255)
++			XD("slot %d port %d -> %d", i, me, dst_port);
++		if (dst_port == NM_BDG_NOPORT)
++			continue; /* this packet is identified to be dropped */
++		else if (unlikely(dst_port > NM_BDG_MAXPORTS))
++			continue;
++		else if (dst_port == NM_BDG_BROADCAST)
++			dst_ring = 0; /* broadcasts always go to ring 0 */
++		else if (unlikely(dst_port == me ||
++		    !b->xen_bdg_ports[dst_port]))
++			continue;
++
++		/* get a position in the scratch pad */
++		d_i = dst_port * NM_BDG_MAXRINGS + dst_ring;
++		d = dst_ents + d_i;
++
++		/* append the first fragment to the list */
++		if (d->bq_head == NM_FT_NULL) { /* new destination */
++			d->bq_head = d->bq_tail = i;
++			/* remember this position to be scanned later */
++			if (dst_port != NM_BDG_BROADCAST)
++				dsts[num_dsts++] = d_i;
++		} else {
++			ft[d->bq_tail].ft_next = i;
++			d->bq_tail = i;
++		}
++		d->bq_len += ft[i].ft_frags;
++	}
++
++	/*
++	 * Broadcast traffic goes to ring 0 on all destinations.
++	 * So we need to add these rings to the list of ports to scan.
++	 * XXX at the moment we scan all NM_BDG_MAXPORTS ports, which is
++	 * expensive. We should keep a compact list of active destinations
++	 * so we could shorten this loop.
++	 */
++	brddst = dst_ents + NM_BDG_BROADCAST * NM_BDG_MAXRINGS;
++	if (brddst->bq_head != NM_FT_NULL) {
++		u_int j;
++		for (j = 0; likely(j < b->bdg_active_ports); j++) {
++			uint16_t d_i;
++			i = b->bdg_port_index[j];
++			if (unlikely(i == me))
++				continue;
++			d_i = i * NM_BDG_MAXRINGS;
++			if (dst_ents[d_i].bq_head == NM_FT_NULL)
++				dsts[num_dsts++] = d_i;
++		}
++	}
++
++	//ND(5, "pass 1 done %d pkts %d dsts", n, num_dsts);
++	/* second pass: scan destinations */
++	for (i = 0; i < num_dsts; i++) {
++		struct netmapif *dst_nmif;
++		struct netmap_kring *kring;
++		struct netmap_ring *ring;
++		u_int dst_nr, lim, j, d_i, next, brd_next;
++		u_int needed, howmany;
++		int retry = netmap_txsync_retry;
++		struct nm_bdg_q *d;
++		uint32_t my_start = 0, lease_idx = 0;
++		int nrings;
++		int virt_hdr_mismatch = 0;
++
++		d_i = dsts[i];
++		//ND("second pass %d port %d", i, d_i);
++		d = dst_ents + d_i;
++		// XXX fix the division
++		dst_nmif = b->xen_bdg_ports[d_i/NM_BDG_MAXRINGS];
++
++		/* protect from the lookup function returning an inactive
++		 * destination port
++		 */
++		if (unlikely(dst_nmif == NULL))
++			goto cleanup;
++		if (*dst_nmif->up_na_flags & NAF_SW_ONLY)
++			goto cleanup;
++		/*
++		 * The interface may be in !netmap mode in two cases:
++		 * - when na is attached but not activated yet;
++		 * - when na is being deactivated but is still attached.
++		 */
++		if (unlikely(!nm_netmap_on(dst_nmif))) {
++			XD("not in netmap mode!");
++			goto cleanup;
++		}
++
++		/* there is at least one either unicast or broadcast packet */
++		brd_next = brddst->bq_head;
++		next = d->bq_head;
++		/* we need to reserve this many slots. If fewer are
++		 * available, some packets will be dropped.
++		 * Packets may have multiple fragments, so we may not use
++		 * there is a chance that we may not use all of the slots
++		 * we have claimed, so we will need to handle the leftover
++		 * ones when we regain the lock.
++		 */
++		needed = d->bq_len + brddst->bq_len;
++
++		if (unlikely(*dst_nmif->up_virt_hdr_len != *nmif->up_virt_hdr_len)) {
++			XD("virt_hdr_mismatch, src %d dst %d", *nmif->up_virt_hdr_len,
++			      *dst_nmif->up_virt_hdr_len);
++			/* There is a virtio-net header/offloadings mismatch between
++			 * source and destination. The slower mismatch datapath will
++			 * be used to cope with all the mismatches.
++			 */
++			virt_hdr_mismatch = 1;
++			if (*dst_nmif->mfs < *nmif->mfs) {
++				/* We may need to do segmentation offloadings, and so
++				 * we may need a number of destination slots greater
++				 * than the number of input slots ('needed').
++				 * We look for the smallest integer 'x' which satisfies:
++				 *	needed * na->mfs + x * H <= x * na->mfs
++				 * where 'H' is the length of the longest header that may
++				 * be replicated in the segmentation process (e.g. for
++				 * TCPv4 we must account for ethernet header, IP header
++				 * and TCPv4 header).
++				 */
++				needed = (needed * *nmif->mfs) /
++						(*dst_nmif->mfs - WORST_CASE_GSO_HEADER) + 1;
++				//ND(3, "srcmtu=%u, dstmtu=%u, x=%u", nmif->mfs, dst_nmif->mfs, needed);
++			}
++		}
++
++		//ND(5, "pass 2 dst %d is %x %s",
++		//	i, d_i, is_vp ? "virtual" : "nic/host");
++		//dst_nr = d_i & (NM_BDG_MAXRINGS-1);
++		//dst_nr = smp_processor_id() & (NM_BDG_MAXRINGS-1);
++		dst_nr = (smp_processor_id()+1) & (NM_BDG_MAXRINGS-1);
++		nrings = dst_nmif->num_rx_rings;
++		if (dst_nr >= nrings)
++			dst_nr = dst_nr % nrings;
++		kring = dst_nmif->rx_rings[dst_nr];
++		ring = kring->xen_ring;
++		lim = kring->nkr_num_slots - 1;
++
++retry:
++
++		if (dst_nmif->retry && retry) {
++			/* try to get some free slot from the previous run */
++			kring->xen_nm_notify(kring, 0);
++			/* actually useful only for bwraps, since there
++			 * the notify will trigger a txsync on the hwna. VALE ports
++			 * have dst_na->retry == 0
++			 */
++		}
++		/* reserve the buffers in the queue and an entry
++		 * to report completion, and drop lock.
++		 * XXX this might become a helper function.
++		 */
++		mtx_lock(&kring->q_lock);
++		if (kring->nkr_stopped) {
++			mtx_unlock(&kring->q_lock);
++			goto cleanup;
++		}
++		my_start = j = kring->nkr_hwlease;
++		howmany = nm_kr_space(kring, 1);
++		if (needed < howmany)
++			howmany = needed;
++		lease_idx = nm_kr_lease(kring, howmany, 1);
++		mtx_unlock(&kring->q_lock);
++
++		/* only retry if we need more than available slots */
++		if (retry && needed <= howmany)
++			retry = 0;
++
++		/* copy to the destination queue */
++		while (howmany > 0) {
++			struct netmap_slot *slot;
++			struct nm_bdg_fwd *ft_p, *ft_end;
++			u_int cnt;
++
++			/* find the queue from which we pick next packet.
++			 * NM_FT_NULL is always higher than valid indexes
++			 * so we never dereference it if the other list
++			 * has packets (and if both are empty we never
++			 * get here).
++			 */
++			if (next < brd_next) {
++				ft_p = ft + next;
++				next = ft_p->ft_next;
++			} else { /* insert broadcast */
++				ft_p = ft + brd_next;
++				brd_next = ft_p->ft_next;
++			}
++			cnt = ft_p->ft_frags; // cnt > 0
++			if (unlikely(cnt > howmany))
++			    break; /* no more space */
++			if (netmap_verbose && cnt > 1)
++				XD("rx %d frags to %d", cnt, j);
++			ft_end = ft_p + cnt;
++			if (unlikely(virt_hdr_mismatch)) {
++				XD("Xen doesn't support bdg_mismatch_datapath");
++				//bdg_mismatch_datapath(na, dst_nmif, ft_p, ring, &j, lim, &howmany);
++			} else {
++				howmany -= cnt;
++				do {
++					char *dst, *src = ft_p->ft_buf;
++					size_t copy_len = ft_p->ft_len, dst_len = copy_len;
++
++					slot = &ring->slot[j];
++					dst = XENNET_NMB(dst_nmif, slot);
++
++					//ND("send [%d] %d(%d) bytes at %s:%d",
++					//		i, (int)copy_len, (int)dst_len,
++					//		NM_IFPNAME(dst_ifp), j);
++					/* round to a multiple of 64 */
++					copy_len = (copy_len + 63) & ~63;
++
++					if (unlikely(copy_len > NETMAP_BUF_SIZE(dst_nmif) ||
++						     copy_len > NETMAP_BUF_SIZE(nmif))) {
++						XD("invalid len %d, down to 64", (int)copy_len);
++						copy_len = dst_len = 64; // XXX
++					}
++					if (ft_p->ft_flags & NS_INDIRECT) {
++						XD("NS_INDIRECT is not supported, skip");
++						//if (copyin(src, dst, copy_len)) {
++						//	// invalid user pointer, pretend len is 0
++						//	dst_len = 0;
++						//}
++					} else {
++						//memcpy(dst, src, copy_len);
++						pkt_copy(src, dst, (int)copy_len);
++					}
++					slot->len = dst_len;
++					slot->flags = (cnt << 8)| NS_MOREFRAG;
++					j = nm_next(j, lim);
++					needed--;
++					ft_p++;
++				} while (ft_p != ft_end);
++				slot->flags = (cnt << 8); /* clear flag on last entry */
++			}
++			/* are we done ? */
++			if (next == NM_FT_NULL && brd_next == NM_FT_NULL)
++				break;
++		}
++		{
++		    /* current position */
++		    uint32_t *p = kring->xen_nkr_leases; /* shorthand */
++		    uint32_t update_pos;
++		    int still_locked = 1;
++		    mtx_lock(&kring->q_lock);
++		    if (unlikely(howmany > 0)) {
++			/* not used all bufs. If i am the last one
++			 * i can recover the slots, otherwise must
++			 * fill them with 0 to mark empty packets.
++			 */
++			//ND("leftover %d bufs", howmany);
++			if (nm_next(lease_idx, lim) == kring->nkr_lease_idx) {
++			    /* yes i am the last one */
++			    //ND("roll back nkr_hwlease to %d", j);
++			    kring->nkr_hwlease = j;
++			} else {
++			    while (howmany-- > 0) {
++				ring->slot[j].len = 0;
++				ring->slot[j].flags = 0;
++				j = nm_next(j, lim);
++			    }
++			}
++		    }
++		    p[lease_idx] = j; /* report I am done */
++
++		    update_pos = kring->nr_hwtail;
++
++		    if (my_start == update_pos) {
++			/* all slots before my_start have been reported,
++			 * so scan subsequent leases to see if other ranges
++			 * have been completed, and to a selwakeup or txsync.
++		         */
++			while (lease_idx != kring->nkr_lease_idx &&
++				p[lease_idx] != NR_NOSLOT) {
++			    j = p[lease_idx];
++			    p[lease_idx] = NR_NOSLOT;
++			    lease_idx = nm_next(lease_idx, lim);
++			}
++			/* j is the new 'write' position. j != my_start
++			 * means there are new buffers to report
++			 */
++			if (likely(j != my_start)) {
++				kring->nr_hwtail = j;
++				still_locked = 0;
++				mtx_unlock(&kring->q_lock);
++				kring->xen_nm_notify(kring, 0);
++				/* this is netmap_notify for VALE ports and
++				 * netmap_bwrap_notify for bwrap. The latter will
++				 * trigger a txsync on the underlying hwna
++				 */
++				if (dst_nmif->retry && retry--) {
++					/* XXX this is going to call nm_notify again.
++					 * Only useful for bwrap in virtual machines
++					 */
++					goto retry;
++				}
++			}
++		    }
++		    if (still_locked) {
++			mtx_unlock(&kring->q_lock);
++		    }
++		}
++cleanup:
++		d->bq_head = d->bq_tail = NM_FT_NULL; /* cleanup */
++		d->bq_len = 0;
++	}
++	brddst->bq_head = brddst->bq_tail = NM_FT_NULL; /* cleanup */
++	brddst->bq_len = 0;
++	return 0;
++}
++
++static int
++nm_bdg_preflush(struct netmap_kring *kring, u_int end)
++{
++	struct netmapif *nmif = kring->nmif;
++	struct netmap_ring *ring = kring->xen_ring;
++	struct nm_bdg_fwd *ft;
++	u_int ring_nr = kring->ring_id;
++	u_int j = kring->nr_hwcur, lim = kring->nkr_num_slots - 1;
++	u_int ft_i = 0;	/* start from 0 */
++	u_int frags = 1; /* how many frags ? */
++	struct nm_bridge *b = nmif->na_bdg;
++	/* To protect against modifications to the bridge we acquire a
++	 * shared lock, waiting if we can sleep (if the source port is
++	 * attached to a user process) or with a trylock otherwise (NICs).
++	 */
++	//ND("wait rlock for %d packets", ((j > end ? lim+1 : 0) + end) - j);
++	//if (*nmif->up_na_flags & NAF_BDG_MAYSLEEP)
++		BDG_RLOCK(b);
++	//else if (!BDG_RTRYLOCK(b))
++	//	return 0;
++	//ND(5, "rlock acquired for %d packets", ((j > end ? lim+1 : 0) + end) - j);
++	ft = kring->xen_nkr_ft;
++
++	for (; likely(j != end); j = nm_next(j, lim)) {
++		struct netmap_slot *slot = &ring->slot[j];
++		char *buf;
++		ft[ft_i].ft_len = slot->len;
++		ft[ft_i].ft_flags = slot->flags;
++
++		//ND("flags is 0x%x", slot->flags);
++		/* we do not use the buf changed flag, but we still need to reset it */
++		slot->flags &= ~NS_BUF_CHANGED;
++
++		/* this slot goes into a list so initialize the link field */
++		ft[ft_i].ft_next = NM_FT_NULL;
++		if (slot->flags & NS_INDIRECT) {
++			XD("!!! Xen doesn't support NS_INDIRECT currently");
++			continue;
++		}
++		//buf = ft[ft_i].ft_buf = (slot->flags & NS_INDIRECT) ?
++		//	(void *)(uintptr_t)slot->ptr : NETMAP_BUF(ring, slot->buf_idx);
++		buf = ft[ft_i].ft_buf = XENNET_NMB(nmif, slot);
++		if (unlikely(buf == NULL)) {
++			XD("NULL %s buffer pointer from slot %d len %d",
++				(slot->flags & NS_INDIRECT) ? "INDIRECT" : "DIRECT",
++				j, ft[ft_i].ft_len);
++			//buf = ft[ft_i].ft_buf = NETMAP_BUF_BASE(&na->up);
++			buf = ft[ft_i].ft_buf = NULL;
++			ft[ft_i].ft_len = 0;
++			ft[ft_i].ft_flags = 0;
++		}
++		__builtin_prefetch(buf);
++		++ft_i;
++		if (slot->flags & NS_MOREFRAG) {
++			frags++;
++			continue;
++		}
++		if (unlikely(netmap_verbose && frags > 1))
++			XD("%d frags at %d", frags, ft_i - frags);
++		ft[ft_i - frags].ft_frags = frags;
++		frags = 1;
++		if (unlikely((int)ft_i >= bridge_batch)) {
++			ft_i = nm_bdg_flush(ft, ft_i, nmif, ring_nr);
++		}
++	}
++	if (frags > 1) {
++		/* Here ft_i > 0, ft[ft_i-1].flags has NS_MOREFRAG, and we
++		 * have to fix frags count. */
++		frags--;
++		ft[ft_i - 1].ft_flags &= ~NS_MOREFRAG;
++		ft[ft_i - frags].ft_frags = frags;
++		XD("Truncate incomplete fragment at %d (%d frags)", ft_i, frags);
++	}
++	if (ft_i) {
++		ft_i = nm_bdg_flush(ft, ft_i, nmif, ring_nr);
++	}
++	BDG_RUNLOCK(b);
++	return j;
++}
++
++int
++netmap_xp_txsync(struct netmap_kring *kring, int flags)
++{
++	struct netmapif *nmif = kring->nmif;
++	u_int done;
++	u_int const lim = kring->nkr_num_slots - 1;
++	u_int const head = kring->rhead;
++
++	if (bridge_batch <= 0) { /* testing only */
++		done = head; // used all
++		goto done;
++	}
++	if (!nmif->na_bdg) {
++		done = head;
++		goto done;
++	}
++
++	if (bridge_batch > NM_BDG_BATCH)
++		bridge_batch = NM_BDG_BATCH;
++
++	done = nm_bdg_preflush(kring, head);
++done:
++	if (done != head)
++		XD("early break at %d/ %d, tail %d", done, head, kring->nr_hwtail);
++	/*
++	 * packets between 'done' and 'cur' are left unsent.
++	 */
++	kring->nr_hwcur = done;
++	kring->nr_hwtail = nm_prev(done, lim);
++	//if (netmap_verbose)
++	//	D("%s ring %d flags %d", na->up.name, kring->ring_id, flags);
++	return 0;
++}
++
++u_int
++nm_txsync_prologue(struct netmap_kring *kring, struct netmap_ring *ring)
++{
++	u_int head = ring->head; /* read only once */
++	u_int cur = ring->cur; /* read only once */
++	u_int n = kring->nkr_num_slots;
++
++	//ND(5, "%s kcur %d ktail %d head %d cur %d tail %d",
++	//	kring->name,
++	//	kring->nr_hwcur, kring->nr_hwtail,
++	//	ring->head, ring->cur, ring->tail);
++#if 1 /* kernel sanity checks; but we can trust the kring. */
++	NM_FAIL_ON(kring->nr_hwcur >= n || kring->rhead >= n ||
++	    kring->rtail >= n ||  kring->nr_hwtail >= n);
++#endif /* kernel sanity checks */
++	/*
++	 * user sanity checks. We only use head,
++	 * A, B, ... are possible positions for head:
++	 *
++	 *  0    A  rhead   B  rtail   C  n-1
++	 *  0    D  rtail   E  rhead   F  n-1
++	 *
++	 * B, F, D are valid. A, C, E are wrong
++	 */
++	if (kring->rtail >= kring->rhead) {
++		/* want rhead <= head <= rtail */
++		NM_FAIL_ON(head < kring->rhead || head > kring->rtail);
++		/* and also head <= cur <= rtail */
++		NM_FAIL_ON(cur < head || cur > kring->rtail);
++	} else { /* here rtail < rhead */
++		/* we need head outside rtail .. rhead */
++		NM_FAIL_ON(head > kring->rtail && head < kring->rhead);
++
++		/* two cases now: head <= rtail or head >= rhead  */
++		if (head <= kring->rtail) {
++			/* want head <= cur <= rtail */
++			NM_FAIL_ON(cur < head || cur > kring->rtail);
++		} else { /* head >= rhead */
++			/* cur must be outside rtail..head */
++			NM_FAIL_ON(cur > kring->rtail && cur < head);
++		}
++	}
++	if (ring->tail != kring->rtail) {
++		XD("tail overwritten was %d need %d",
++			ring->tail, kring->rtail);
++		ring->tail = kring->rtail;
++	}
++	kring->rhead = head;
++	kring->rcur = cur;
++	return head;
++}
++
++u_int
++nm_rxsync_prologue(struct netmap_kring *kring, struct netmap_ring *ring)
++{
++	uint32_t const n = kring->nkr_num_slots;
++	uint32_t head, cur;
++
++	//ND(5,"%s kc %d kt %d h %d c %d t %d",
++	//	kring->name,
++	//	kring->nr_hwcur, kring->nr_hwtail,
++	//	ring->head, ring->cur, ring->tail);
++	/*
++	 * Before storing the new values, we should check they do not
++	 * move backwards. However:
++	 * - head is not an issue because the previous value is hwcur;
++	 * - cur could in principle go back, however it does not matter
++	 *   because we are processing a brand new rxsync()
++	 */
++	cur = kring->rcur = ring->cur;	/* read only once */
++	head = kring->rhead = ring->head;	/* read only once */
++#if 1 /* kernel sanity checks */
++	NM_FAIL_ON(kring->nr_hwcur >= n || kring->nr_hwtail >= n);
++#endif /* kernel sanity checks */
++	/* user sanity checks */
++	if (kring->nr_hwtail >= kring->nr_hwcur) {
++		/* want hwcur <= rhead <= hwtail */
++		NM_FAIL_ON(head < kring->nr_hwcur || head > kring->nr_hwtail);
++		/* and also rhead <= rcur <= hwtail */
++		NM_FAIL_ON(cur < head || cur > kring->nr_hwtail);
++	} else {
++		/* we need rhead outside hwtail..hwcur */
++		NM_FAIL_ON(head < kring->nr_hwcur && head > kring->nr_hwtail);
++		/* two cases now: head <= hwtail or head >= hwcur  */
++		if (head <= kring->nr_hwtail) {
++			/* want head <= cur <= hwtail */
++			NM_FAIL_ON(cur < head || cur > kring->nr_hwtail);
++		} else {
++			/* cur must be outside hwtail..head */
++			NM_FAIL_ON(cur < head && cur > kring->nr_hwtail);
++		}
++	}
++	if (ring->tail != kring->rtail) {
++		XD("tail overwritten was %d need %d",
++			ring->tail, kring->rtail);
++		ring->tail = kring->rtail;
++	}
++	return head;
++}
++
++int netmap_tx(struct netmapif *nmif)
++{
++	struct netmap_kring *kring;
++	int i, ret = 0;
++
++	for (i = 0; i < nmif->num_tx_rings; i++) {
++		kring = nmif->tx_rings[i];
++		if (unlikely(!kring)) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (unlikely(nm_kr_tryget(kring, 0, &ret))) {
++			XD("tryget failed");
++			continue;
++		}
++		if (nm_txsync_prologue(kring, kring->xen_ring) >= kring->nkr_num_slots) {
++			netmap_ring_reinit(kring);
++		} else if (kring->xen_nm_sync(kring, 0) == 0) {
++			nm_sync_finalize(kring);
++		}
++		nm_kr_put(kring);
++	}
++out:
++	return ret;
++}
++
++int netmap_rx(struct netmapif *nmif)
++{
++	struct netmap_kring *kring;
++	int i, ret = 0;
++
++	for (i = 0; i < nmif->num_rx_rings; i++) {
++		kring = nmif->rx_rings[i];
++		if (unlikely(!kring)) {
++			ret = -EINVAL;
++			goto out;
++		}
++		if (unlikely(nm_kr_tryget(kring, 0, &ret))) {
++			XD("tryget failed");
++			continue;
++		}
++		if (nm_rxsync_prologue(kring, kring->xen_ring) >= kring->nkr_num_slots) {
++			netmap_ring_reinit(kring);
++		} else if (kring->xen_nm_sync(kring, 0) == 0) {
++			nm_sync_finalize(kring);
++		}
++		nm_kr_put(kring);
++	}
++out:
++	return 0;
++}
++
++int netmap_set_bridge_batch(int new_bridge_batch)
++{
++	int ret = 0;
++	if (new_bridge_batch < 0 || new_bridge_batch > NM_BDG_BATCH) {
++		XD("Invalid bridge_batch %d, MIN 0, MAX %d", new_bridge_batch, NM_BDG_BATCH);
++		ret = -EINVAL;
++	} else {
++		XD("Set new bridge_batch %d, (old : %d)", new_bridge_batch, bridge_batch);
++		bridge_batch = new_bridge_batch;
++	}
++	return 0;
++}
+diff --git a/xen/common/xennet/xennet_common.h b/xen/common/xennet/xennet_common.h
+new file mode 100644
+index 0000000..98f7d79
+--- /dev/null
++++ b/xen/common/xennet/xennet_common.h
+@@ -0,0 +1,655 @@
++/*
++ *
++ * Copyright (c) 2016-2017, NEC Europe Ltd., NEC Corporation All rights reserved.
++ *
++ * Authors: Kenichi Yasukata
++ *
++ */
++
++#ifndef _XENNET_COMMON_H
++#define _XENNET_COMMON_H
++
++#include <xen/err.h>
++#include <xen/lib.h>
++#include <xen/mm.h>
++#include <xen/event.h>
++#include <xen/trace.h>
++#include <xen/guest_access.h>
++#include <xen/domain_page.h>
++#include <xen/paging.h>
++#include <xen/keyhandler.h>
++#include <xen/vmap.h>
++#include <asm/byteorder.h>
++
++#include <asm/p2m.h>
++
++#include <asm/setup.h>
++
++#define IFNAMSIZ 16
++
++struct timeval {
++	long tv_sec;
++	long tv_usec;
++};
++
++#include <net/netmap.h>
++
++// Copied from linux
++#define __ACCESS_ONCE(x) ({ \
++         __maybe_unused typeof(x) __var = (__force typeof(x)) 0; \
++        (volatile typeof(x) *)&(x); })
++#define ACCESS_ONCE(x) (*__ACCESS_ONCE(x))
++#include <xennet_lock.h>
++
++/* helper macro */
++// XXX: Shared with netmap
++
++#define _NETMAP_OFFSET(type, ptr, offset) \
++	((type)(void *)((char *)(ptr) + (offset)))
++
++#define NETMAP_IF(_base, _ofs)	_NETMAP_OFFSET(struct netmap_if *, _base, _ofs)
++
++#define NETMAP_TXRING(nifp, index) _NETMAP_OFFSET(struct netmap_ring *, \
++	nifp, (nifp)->ring_ofs[index] )
++
++#define NETMAP_RXRING(nifp, index) _NETMAP_OFFSET(struct netmap_ring *,	\
++	nifp, (nifp)->ring_ofs[index + (nifp)->ni_tx_rings + 1] )
++
++#define NETMAP_BUF(ring, index)				\
++	((char *)(ring) + (ring)->buf_ofs + ((index)*(ring)->nr_buf_size))
++
++#define NETMAP_BUF_IDX(ring, buf)			\
++	( ((char *)(buf) - ((char *)(ring) + (ring)->buf_ofs) ) / \
++		(ring)->nr_buf_size )
++
++#define XD(fmt, ...) \
++	printk("[%lu][%s]: "fmt"\n", NOW(), __func__, ##__VA_ARGS__)
++
++#define ND(fmt, ...)
++
++#define NM_FAIL_ON(t) do {						\
++	if (unlikely(t)) {						\
++		XD(": fail '" #t "' "				\
++			"h %d c %d t %d "				\
++			"rh %d rc %d rt %d "				\
++			"hc %d ht %d",					\
++			head, cur, ring->tail,				\
++			kring->rhead, kring->rcur, kring->rtail,	\
++			kring->nr_hwcur, kring->nr_hwtail);		\
++		return kring->nkr_num_slots;				\
++	}								\
++} while (0)
++
++//--------------- Shared Object -----------------
++// XXX: Shared with netmapback
++
++#define XENNET_ok  0
++#define XENNET_bad_domain 1
++
++#define XENNETOP_none 0
++#define XENNETOP_mem_netmap 1
++#define XENNETOP_sync 3
++#define XENNETOP_ctrl 8
++
++#define XENNETOP_MEM_map_netmap 1
++#define XENNETOP_MEM_unmap_netmap 2
++#define XENNETOP_MEM_map_kring 3
++#define XENNETOP_MEM_unmap_kring 4
++#define XENNETOP_MEM_map_nmif_objoff 5
++#define XENNETOP_MEM_unmap_nmif_objoff 6
++#define XENNETOP_MEM_map_kring_objoff 7
++#define XENNETOP_MEM_unmap_kring_objoff 8
++//#define XENNETOP_MEM_bdg_attach 9 // Not used, but reserve
++#define XENNETOP_MEM_bdg_detach 10
++#define XENNETOP_MEM_bind_hwsw 11
++#define XENNETOP_MEM_unbind_hwsw 12
++#define XENNETOP_MEM_map_i40e 51
++#define XENNETOP_MEM_unmap_i40e 52
++#define XENNETOP_MEM_map_i40e_objoff 53
++#define XENNETOP_MEM_unmap_i40e_objoff 54
++
++#define XENNETOP_IRQ_register 1
++#define XENNETOP_IRQ_unregister 2
++
++#define XENNET_IRQTYPE_I40E 1
++
++#define XENNETOP_CTRL_SET_BDG_BATCH 1
++#define XENNETOP_CTRL_SET_I40E_BUSY_WAIT 2
++#define XENNETOP_CTRL_SET_CSCHED2_MIN_TIMER 3
++#define XENNETOP_CTRL_SET_CSCHED2_CREDIT_INIT 4
++#define XENNETOP_CTRL_SET_DRVDOM_TXSYNC 5
++
++#define XENNET_MAX_IF 128
++
++#define INVALID_IF_ID (-1)
++
++struct xennet_mem_op {
++	domid_t dom;
++	domid_t target_dom;
++	int16_t status;
++	int16_t id;
++	int16_t id2;
++	int16_t op;
++	int16_t op2;
++	uint64_t objoff;
++	uint64_t pgoff;
++	paddr_t pa;
++	uint32_t len;
++	uint32_t nr_frames;
++	XEN_GUEST_HANDLE(xen_pfn_t) frame_list;
++};
++
++typedef struct xennet_mem_op xennet_mem_op_t;
++DEFINE_XEN_GUEST_HANDLE(xennet_mem_op_t);
++
++struct xennet_irq_op {
++	domid_t dom;
++	int16_t id;
++	int16_t id2;
++	int16_t op;
++	int16_t pirq;
++	int16_t type;
++};
++
++typedef struct xennet_irq_op xennet_irq_op_t;
++DEFINE_XEN_GUEST_HANDLE(xennet_irq_op_t);
++
++struct xennet_bench_op {
++	uint32_t cnt;
++	uint32_t clean_cnt;
++	uint16_t id;
++};
++
++typedef struct xennet_bench_op xennet_bench_op_t;
++DEFINE_XEN_GUEST_HANDLE(xennet_bench_op_t);
++
++struct xennet_ctrl_op {
++	int16_t id;
++	int16_t op;
++	uint64_t val1;
++	int32_t val2;
++};
++
++typedef struct xennet_ctrl_op xennet_ctrl_op_t;
++DEFINE_XEN_GUEST_HANDLE(xennet_ctrl_op_t);
++
++#ifndef saved_irq_desc
++#define saved_irq_desc(irq) (&ninfo->irq_desc[irq])
++#endif
++
++//--------------------------------------------
++struct netmapif;
++
++extern struct netmapif *hwnmif;
++//------------- netmap Object ----------------
++// XXX: Shared with netmap
++// Copied from netmap_kern.h
++
++#define NM_ATOMIC_T	volatile int // for BSD, we modify lock in linux
++#define NM_LOCK_T       safe_spinlock_t // see bsd_glue.h
++
++enum {
++	/* Driver should do normal interrupt processing, e.g. because
++	 * the interface is not in netmap mode. */
++	NM_IRQ_PASS = 0,
++	/* Port is in netmap mode, and the interrupt work has been
++	 * completed. The driver does not have to notify netmap
++	 * again before the next interrupt. */
++	NM_IRQ_COMPLETED = -1,
++	/* Port is in netmap mode, but the interrupt work has not been
++	 * completed. The driver has to make sure netmap will be
++	 * notified again soon, even if no more interrupts come (e.g.
++	 * on Linux the driver should not call napi_complete()). */
++	NM_IRQ_RESCHED = -2,
++};
++
++enum txrx { NR_RX = 0, NR_TX = 1, NR_TXRX };
++
++/* Top half that has required info */
++struct netmap_kring {
++	struct netmap_ring	*ring;
++
++	uint32_t	nr_hwcur;
++	uint32_t	nr_hwtail;
++
++	/*
++	 * Copies of values in user rings, so we do not need to look
++	 * at the ring (which could be modified). These are set in the
++	 * *sync_prologue()/finalize() routines.
++	 */
++	uint32_t	rhead;
++	uint32_t	rcur;
++	uint32_t	rtail;
++
++	uint32_t	nr_kflags;	/* private driver flags */
++#define NKR_PENDINTR	0x1		// Pending interrupt.
++#define NKR_EXCLUSIVE	0x2		/* exclusive binding */
++#define NKR_FORWARD	0x4		/* (host ring only) there are
++					   packets to forward
++					 */
++
++	uint32_t	nr_mode;
++	uint32_t	nr_pending_mode;
++#define NKR_NETMAP_OFF	0x0
++#define NKR_NETMAP_ON	0x1
++
++	uint32_t	nkr_num_slots;
++
++	/*
++	 * On a NIC reset, the NIC ring indexes may be reset but the
++	 * indexes in the netmap rings remain the same. nkr_hwofs
++	 * keeps track of the offset between the two.
++	 */
++	int32_t		nkr_hwofs;
++
++	uint16_t	nkr_slot_flags;	/* initial value for flags */
++
++	/* last_reclaim is opaque marker to help reduce the frequency
++	 * of operations such as reclaiming tx buffers. A possible use
++	 * is set it to ticks and do the reclaim only once per tick.
++	 */
++	uint64_t	last_reclaim;
++
++	/* XXX: for xennet, we change the order of structure components */
++
++	struct netmapif		*nmif;
++	struct domain		*xen_domain;
++	uint16_t		xen_irq1;
++	uint16_t		xen_irq2;
++	uint16_t		evtchn_port;
++	struct netmap_ring	*xen_ring;
++	struct nm_bdg_fwd	*xen_nkr_ft;
++	uint32_t		*xen_nkr_leases;
++	int (*xen_nm_sync)(struct netmap_kring *kring, int flags);
++	int (*xen_nm_notify)(struct netmap_kring *kring, int flags);
++
++	int (*xen_vp_sync)(struct netmap_kring *kring, int flags);
++
++	uint32_t	ring_id;        /* kring identifier */
++	enum txrx	tx;             /* kind of ring (tx or rx) */
++
++	/* while nkr_stopped is set, no new [tr]xsync operations can
++	 * be started on this kring.
++	 * This is used by netmap_disable_all_rings()
++	 * to find a synchronization point where critical data
++	 * structures pointed to by the kring can be added or removed
++	 */
++	volatile int nkr_stopped;
++
++	/* (Moved) The following fields are for VALE switch support */
++	struct nm_bdg_fwd *nkr_ft;
++	uint32_t	*nkr_leases;
++#define NR_NOSLOT	((uint32_t)~0)	/* used in nkr_*lease* */
++	uint32_t	nkr_hwlease;
++	uint32_t	nkr_lease_idx;
++
++//#ifdef WITH_PIPES
++	struct netmap_kring *pipe;	/* if this is a pipe ring,
++					 * pointer to the other end
++					 */
++	struct netmap_ring *save_ring;	/* pointer to hidden rings
++       					 * (see netmap_pipe.c for details)
++					 */
++//#endif /* WITH_PIPES */
++
++	NM_ATOMIC_T	nr_busy;	/* prevent concurrent syscalls */
++	NM_LOCK_T       q_lock;		/* protects kring and ring. */
++};
++
++#define NM_KR_BUSY	1	/* some other thread is syncing the ring */
++#define NM_KR_STOPPED	2	/* unbounded stop (ifconfig down or driver unload) */
++#define NM_KR_LOCKED	3	/* bounded, brief stop for mutual exclusion */
++
++#define NM_ATOMIC_TEST_AND_SET(p)       (!atomic_cmpset_int((p), 0, 1))
++#define NM_ATOMIC_CLEAR(p)              atomic_store_rel_int((p), 0)
++
++//#define BDG_RWLOCK_T		rwticket
++#define BDG_RWLOCK_T		safe_spinlock_t
++#define BDG_RWINIT(b)		memset(b, 0, sizeof(rwticket))
++#define BDG_RWDESTROY(b)
++//#define BDG_WLOCK(b)		rwticket_wrlock(&(b)->bdg_lock)
++#define BDG_WLOCK(b)		bdg_wrlock(&(b)->bdg_lock)
++//#define BDG_WUNLOCK(b)		rwticket_wrunlock(&(b)->bdg_lock)
++#define BDG_WUNLOCK(b)		bdg_wrunlock(&(b)->bdg_lock)
++//#define BDG_RLOCK(b)		rwticket_rdlock(&(b)->bdg_lock)
++#define BDG_RLOCK(b)		bdg_rdlock(&(b)->bdg_lock)
++//#define BDG_RUNLOCK(b)		rwticket_rdunlock(&(b)->bdg_lock)
++#define BDG_RUNLOCK(b)		bdg_rdunlock(&(b)->bdg_lock)
++//#define BDG_RTRYLOCK(b)		rwticket_rdtrylock(&(b)->bdg_lock)
++#define BDG_RTRYLOCK(b)		bdg_rdtrylock(&(b)->bdg_lock)
++#define BDG_SET_VAR(lval, p)	((lval) = (p))
++#define BDG_GET_VAR(lval)	(lval)
++#define BDG_FREE(p)		xfree(p)
++
++#define	NM_BRIDGES		8	/* number of bridges */
++#define	NM_BDG_MAXPORTS		254	/* up to 254 */
++#define	NM_BDG_BROADCAST	NM_BDG_MAXPORTS
++#define	NM_BDG_NOPORT		(NM_BDG_MAXPORTS+1)
++
++#define NM_BDG_MAXRINGS		16	/* XXX unclear how many. */
++#define NM_BDG_MAXSLOTS		4096	/* XXX same as above */
++#define NM_BRIDGE_RINGSIZE	1024	/* in the device */
++#define NM_BDG_HASH		1024	/* forwarding table entries */
++#define NM_BDG_BATCH		1024	/* entries in the forwarding buffer */
++#define NM_MULTISEG		64	/* max size of a chain of bufs */
++/* actual size of the tables */
++#define NM_BDG_BATCH_MAX	(NM_BDG_BATCH + NM_MULTISEG)
++/* NM_FT_NULL terminates a list of slots in the ft */
++#define NM_FT_NULL		NM_BDG_BATCH_MAX
++
++#define le16toh			le16_to_cpu
++#define le32toh			le32_to_cpu
++#define le64toh			le64_to_cpu
++#define be16toh			be16_to_cpu
++#define be32toh			be32_to_cpu
++#define be64toh			be64_to_cpu
++#define htole32			cpu_to_le32
++#define htole64			cpu_to_le64
++#define htobe16			cpu_to_be16
++#define htobe32			cpu_to_be32
++
++#define WORST_CASE_GSO_HEADER	(14+40+60)  /* IPv6 + TCP */
++
++struct nm_bdg_fwd {	/* forwarding entry for a bridge */
++	void *ft_buf;		/* netmap or indirect buffer */
++	uint8_t ft_frags;	/* how many fragments (only on 1st frag) */
++	uint8_t _ft_port;	/* dst port (unused) */
++	uint16_t ft_flags;	/* flags, e.g. indirect */
++	uint16_t ft_len;	/* src fragment len */
++	uint16_t ft_next;	/* next packet to same destination */
++};
++
++struct nm_hash_ent {
++	uint64_t	mac;	/* the top 2 bytes are the epoch */
++	uint64_t	ports;
++};
++
++struct nm_bdg_q {
++	uint16_t bq_head;
++	uint16_t bq_tail;
++	uint32_t bq_len;	/* number of buffers */
++};
++
++typedef u_int (*bdg_lookup_fn_t)(struct nm_bdg_fwd *ft, uint8_t *ring_nr,
++		struct netmapif *);
++//typedef int (*bdg_config_fn_t)(struct nm_ifreq *);
++typedef int (*bdg_config_fn_t)(void *);
++typedef void (*bdg_dtor_fn_t)(const struct netmapif *);
++struct netmap_bdg_ops {
++	bdg_lookup_fn_t lookup;
++	bdg_config_fn_t config; // dummy, we don't implement
++	bdg_dtor_fn_t	dtor;   // dummy, we don't implement
++};
++
++/* Modified top half */
++struct nm_bridge {
++	/* XXX what is the proper alignment/layout ? */
++	BDG_RWLOCK_T	bdg_lock;	/* protects bdg_ports */
++	int		bdg_namelen;
++	uint32_t	bdg_active_ports; /* 0 means free */
++	char		bdg_basename[IFNAMSIZ];
++
++	/* Indexes of active ports (up to active_ports)
++	 * and all other remaining ports.
++	 */
++	uint8_t		bdg_port_index[NM_BDG_MAXPORTS];
++
++	/* the forwarding table, MAC+ports.
++	 * XXX should be changed to an argument to be passed to
++	 * the lookup function, and allocated on attach
++	 */
++	struct nm_hash_ent ht[NM_BDG_HASH];
++
++	/*
++	 * The function to decide the destination port.
++	 * It returns either of an index of the destination port,
++	 * NM_BDG_BROADCAST to broadcast this packet, or NM_BDG_NOPORT not to
++	 * forward this packet.  ring_nr is the source ring index, and the
++	 * function may overwrite this value to forward this packet to a
++	 * different ring index.
++	 * This function must be set by netmap_bdg_ctl().
++	 */
++	struct netmap_bdg_ops bdg_ops;
++	struct netmap_bdg_ops xen_bdg_ops;
++
++	struct netmapif *xen_bdg_ports[NM_BDG_MAXPORTS]; // Attach/Detach are done by dom0
++};
++
++//--------------------------------------------
++
++#define NETMAP_BUF_SIZE(nmif) (*nmif->nm_buf_size)
++
++// Copied fron Linux
++typedef u64 phys_addr_t;
++#define vm_paddr_t	    phys_addr_t
++
++typedef u64 dma_addr_t;
++
++struct lut_entry {
++	void *vaddr;		/* virtual address. */
++	vm_paddr_t paddr;	/* physical address. */
++	void *xvaddr;		/* Xen virtual address. */
++	pfn_t gfn;
++};
++
++struct hwif {
++	void **hw_tx_rings;
++	void **hw_rx_rings;
++	u32 *txd_cmd;
++	u32 itr_countdown;
++	void *hwinfo;
++	u8 __iomem *hw_addr;
++};
++
++// XXX: Shared with netmapback
++struct netmapif {
++	struct domain *d;
++	struct domain *backend_d;
++	uint16_t id;
++
++	uint16_t num_tx_rings;
++	uint16_t num_rx_rings;
++	struct netmap_kring **tx_rings;
++	struct netmap_kring **rx_rings;
++
++	struct hwif hwif;
++
++	struct netmapif *hwnmif;
++	struct netmapif *swnmif;
++
++	int retry;
++	// netmap_adapter related objs
++	struct nm_bridge *na_bdg;
++#define NAF_SKIP_INTR	1	/* use the regular interrupt handler.
++				 * useful during initialization
++				 */
++#define NAF_SW_ONLY	2	/* forward packets only to sw adapter */
++#define NAF_BDG_MAYSLEEP 4	/* the bridge is allowed to sleep when
++				 * forwarding packets coming from this
++				 * interface
++				 */
++#define NAF_MEM_OWNER	8	/* the adapter uses its own memory area
++				 * that cannot be changed
++				 */
++#define NAF_NATIVE      16      /* the adapter is native.
++				 * Virtual ports (non persistent vale ports,
++				 * pipes, monitors...) should never use
++				 * this flag.
++				 */
++#define	NAF_NETMAP_ON	32	/* netmap is active (either native or
++				 * emulated). Where possible (e.g. FreeBSD)
++				 * IFCAP_NETMAP also mirrors this flag.
++				 */
++#define NAF_HOST_RINGS  64	/* the adapter supports the host rings */
++#define NAF_FORCE_NATIVE 128	/* the adapter is always NATIVE */
++#define NAF_PTNETMAP_HOST 256	/* the adapter supports ptnetmap in the host */
++#define NAF_ZOMBIE	(1U<<30) /* the nic driver has been unloaded */
++#define	NAF_BUSY	(1U<<31) /* the adapter is used internally and
++				  * cannot be registered from userspace
++				  */
++	uint32_t *up_na_flags;
++	uint64_t *last_smac;
++
++	int *bdg_port;
++	u_int *mfs;
++
++	/* Offset of ethernet header for each packet. */
++	u_int *up_virt_hdr_len;
++
++	uint32_t *nm_buf_size;
++	uint32_t *nm_objtotal;
++
++	struct lut_entry *xen_lut;
++};
++
++#define NAF_FORCE_READ    1
++#define NAF_FORCE_RECLAIM 2
++
++struct network_info {
++	struct netmapif *nmifs[XENNET_MAX_IF];
++	spinlock_t nmifs_lock;
++};
++
++int netmap_ring_reinit(struct netmap_kring *kring);
++
++u_int netmap_bdg_learning(struct nm_bdg_fwd *ft, uint8_t *dst_ring, struct netmapif *nmif);
++int netmap_xp_txsync(struct netmap_kring *kring, int flags);
++int netmap_xp_rxsync(struct netmap_kring *kring, int flags);
++int xennet_netmap_notify(struct netmap_kring *kring, int flags);
++int netmap_tx(struct netmapif *nmif);
++int netmap_rx(struct netmapif *nmif);
++int netmap_bwrap_notify(struct netmap_kring *kring, int flags);
++int netmap_bwrap_intr_notify(struct netmap_kring *kring, int flags);
++
++static inline int
++netmap_idx_n2k(struct netmap_kring *kr, int idx)
++{
++	int n = kr->nkr_num_slots;
++	idx += kr->nkr_hwofs;
++	if (idx < 0)
++		return idx + n;
++	else if (idx < n)
++		return idx;
++	else
++		return idx - n;
++}
++
++static inline int
++netmap_idx_k2n(struct netmap_kring *kr, int idx)
++{
++	int n = kr->nkr_num_slots;
++	idx -= kr->nkr_hwofs;
++	if (idx < 0)
++		return idx + n;
++	else if (idx < n)
++		return idx;
++	else
++		return idx - n;
++}
++
++static inline void *
++XENNET_NMB(struct netmapif *nmif, struct netmap_slot *slot)
++{
++	struct lut_entry *lut = nmif->xen_lut;
++	uint32_t i = slot->buf_idx;
++	return (unlikely(i >= *nmif->nm_objtotal)) ?
++		lut[0].xvaddr : lut[i].xvaddr;
++}
++
++static inline void *
++PNMB(struct netmapif *nmif, struct netmap_slot *slot, uint64_t *pp)
++{
++	uint32_t i = slot->buf_idx;
++	struct lut_entry *lut = nmif->xen_lut;
++	void *ret = (i >= *nmif->nm_objtotal) ? lut[0].vaddr : lut[i].vaddr;
++
++	*pp = (i >= *nmif->nm_objtotal) ? lut[0].paddr : lut[i].paddr;
++
++	return ret;
++}
++
++static inline int
++nm_kr_txempty(struct netmap_kring *kring)
++{
++	return kring->rcur == kring->nr_hwtail;
++}
++
++static inline uint32_t
++nm_next(uint32_t i, uint32_t lim)
++{
++	return unlikely (i == lim) ? 0 : i + 1;
++}
++
++static inline uint32_t
++nm_prev(uint32_t i, uint32_t lim)
++{
++	return unlikely (i == 0) ? lim : i - 1;
++}
++
++static inline uint32_t
++nm_ring_next(struct netmap_ring *r, uint32_t i)
++{
++	return ( unlikely(i + 1 == r->num_slots) ? 0 : i + 1);
++}
++
++static inline uint32_t
++nm_ring_prev(struct netmap_ring *r, uint32_t i)
++{
++	return ( unlikely(i == 0) ? r->num_slots - 1 : i - 1);
++}
++
++#define mix(a, b, c)                                                    \
++do {                                                                    \
++        a -= b; a -= c; a ^= (c >> 13);                                 \
++        b -= c; b -= a; b ^= (a << 8);                                  \
++        c -= a; c -= b; c ^= (b >> 13);                                 \
++        a -= b; a -= c; a ^= (c >> 12);                                 \
++        b -= c; b -= a; b ^= (a << 16);                                 \
++        c -= a; c -= b; c ^= (b >> 5);                                  \
++        a -= b; a -= c; a ^= (c >> 3);                                  \
++        b -= c; b -= a; b ^= (a << 10);                                 \
++        c -= a; c -= b; c ^= (b >> 15);                                 \
++} while (/*CONSTCOND*/0)
++
++
++#define	NM_CHECK_ADDR_LEN(_na, _a, _l)	do {				\
++		if (_l > NETMAP_BUF_SIZE(_na))				\
++			_l = NETMAP_BUF_SIZE(_na);			\
++	} while (0)
++
++#define NAF_FORCE_RECLAIM 2
++
++int i40e_netmap_txsync(struct netmap_kring *kring, int flags);
++int i40e_netmap_rxsync(struct netmap_kring *kring, int flags);
++int map_i40e(xennet_mem_op_t *op, struct netmapif *nmif);
++int unmap_i40e(xennet_mem_op_t *op, struct netmapif *nmif);
++int map_i40e_hwobj(xennet_mem_op_t *op, struct netmapif *nmif);
++int unmap_i40e_hwobj(xennet_mem_op_t *op, struct netmapif *nmif);
++void i40e_set_action(struct netmapif *nmif, struct irqaction *action, int id);
++void i40e_set_itr_queue(struct netmapif *nmif);
++
++static inline void vunmap_addr(unsigned long addr)
++{
++	addr &= PAGE_MASK;
++	if (addr)
++		vunmap((void *) addr);
++}
++
++void *network_map_frames(xennet_mem_op_t *op);
++void *network_iomem_map_frames(xennet_mem_op_t *op);
++
++#define NM_TXSYNC_RETRY (2)
++extern int netmap_txsync_retry;
++extern int bridge_batch;
++extern int drvdom_txsync;
++
++void nm_kr_put(struct netmap_kring *kr);
++int nm_kr_tryget(struct netmap_kring *kr, int can_sleep, int *perr);
++
++u_int nm_txsync_prologue(struct netmap_kring *kring, struct netmap_ring *ring);
++u_int nm_rxsync_prologue(struct netmap_kring *kring, struct netmap_ring *ring);
++
++int netmap_set_bridge_batch(int new_bridge_batch);
++int netmap_set_i40e_busy_wait(uint64_t val);
++
++#endif
+-- 
+2.7.4
+

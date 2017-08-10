@@ -1,0 +1,45 @@
+From 35fc5ee46ef4ac7639d40722069c6d19fc9fa617 Mon Sep 17 00:00:00 2001
+From: Kenichi Yasukata <kenichi.yasukata@neclab.eu>
+Date: Mon, 7 Aug 2017 09:43:35 +0100
+Subject: [PATCH 2/7] x86: add hyperio to hypercall entry
+
+---
+ xen/arch/x86/hvm/hvm.c   | 1 +
+ xen/arch/x86/hypercall.c | 2 ++
+ 2 files changed, 3 insertions(+)
+
+diff --git a/xen/arch/x86/hvm/hvm.c b/xen/arch/x86/hvm/hvm.c
+index 25dc759..ed6a218 100644
+--- a/xen/arch/x86/hvm/hvm.c
++++ b/xen/arch/x86/hvm/hvm.c
+@@ -4281,6 +4281,7 @@ static const hypercall_table_t hvm_hypercall_table[] = {
+     COMPAT_CALL(platform_op),
+     COMPAT_CALL(mmuext_op),
+     HYPERCALL(xenpmu_op),
++    HYPERCALL(xennet_op),
+     HYPERCALL(arch_1)
+ };
+ 
+diff --git a/xen/arch/x86/hypercall.c b/xen/arch/x86/hypercall.c
+index d2b5331..161c74d 100644
+--- a/xen/arch/x86/hypercall.c
++++ b/xen/arch/x86/hypercall.c
+@@ -66,6 +66,7 @@ const hypercall_args_t hypercall_args_table[NR_hypercalls] =
+     ARGS(kexec_op, 2),
+     ARGS(tmem_op, 1),
+     ARGS(xenpmu_op, 2),
++    ARGS(xennet_op, 4),
+     ARGS(mca, 1),
+     ARGS(arch_1, 1),
+ };
+@@ -128,6 +129,7 @@ static const hypercall_table_t pv_hypercall_table[] = {
+     HYPERCALL(tmem_op),
+ #endif
+     HYPERCALL(xenpmu_op),
++    HYPERCALL(xennet_op),
+     HYPERCALL(mca),
+     HYPERCALL(arch_1),
+ };
+-- 
+2.7.4
+

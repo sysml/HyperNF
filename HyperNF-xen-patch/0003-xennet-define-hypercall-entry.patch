@@ -1,0 +1,38 @@
+From b5ebd59d94191e0c7c5aa8df0da243a0f8bb6e65 Mon Sep 17 00:00:00 2001
+From: Kenichi Yasukata <kenichi.yasukata@neclab.eu>
+Date: Mon, 7 Aug 2017 09:44:58 +0100
+Subject: [PATCH 3/7] xennet: define hypercall entry
+
+---
+ xen/include/asm-x86/hypercall.h | 3 +++
+ xen/include/public/xen.h        | 2 ++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/xen/include/asm-x86/hypercall.h b/xen/include/asm-x86/hypercall.h
+index c59aa69..9ef1296 100644
+--- a/xen/include/asm-x86/hypercall.h
++++ b/xen/include/asm-x86/hypercall.h
+@@ -182,4 +182,7 @@ extern int compat_physdev_op_compat(XEN_GUEST_HANDLE(physdev_op_compat_t) uop);
+ 
+ #endif /* CONFIG_COMPAT */
+ 
++extern long do_xennet_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) uop, unsigned int count, unsigned int count2);
++
++
+ #endif /* __ASM_X86_HYPERCALL_H__ */
+diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
+index 336aa3f..84b6bad 100644
+--- a/xen/include/public/xen.h
++++ b/xen/include/public/xen.h
+@@ -121,6 +121,8 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
+ #define __HYPERVISOR_xc_reserved_op       39 /* reserved for XenClient */
+ #define __HYPERVISOR_xenpmu_op            40
+ 
++#define __HYPERVISOR_xennet_op            41
++
+ /* Architecture-specific hypercall definitions. */
+ #define __HYPERVISOR_arch_0               48
+ #define __HYPERVISOR_arch_1               49
+-- 
+2.7.4
+

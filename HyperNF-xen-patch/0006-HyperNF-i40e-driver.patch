@@ -1,0 +1,921 @@
+From 7e99f5196e54c8ed02ab7a3ef3cc35da79872459 Mon Sep 17 00:00:00 2001
+From: Kenichi Yasukata <kenichi.yasukata@neclab.eu>
+Date: Thu, 10 Aug 2017 09:11:09 +0100
+Subject: [PATCH 6/7] HyperNF i40e driver
+
+---
+ xen/common/xennet/i40e/i40e_netmap_linux.c | 902 +++++++++++++++++++++++++++++
+ 1 file changed, 902 insertions(+)
+ create mode 100644 xen/common/xennet/i40e/i40e_netmap_linux.c
+
+diff --git a/xen/common/xennet/i40e/i40e_netmap_linux.c b/xen/common/xennet/i40e/i40e_netmap_linux.c
+new file mode 100644
+index 0000000..ab247d8
+--- /dev/null
++++ b/xen/common/xennet/i40e/i40e_netmap_linux.c
+@@ -0,0 +1,902 @@
++/*
++ *
++ * Copyright (c) 2016-2017, NEC Europe Ltd., NEC Corporation All rights reserved.
++ *
++ * Authors: Kenichi Yasukata
++ *
++ */
++
++/*
++ * Copyright (C) 2015, Luigi Rizzo. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ */
++
++/*
++ * $FreeBSD$
++ *
++ * netmap support for: i40e (LINUX version)
++ *
++ * derived from ixgbe
++ * netmap support for a network driver.
++ * This file contains code but only static or inline functions used
++ * by a single driver. To avoid replication of code we just #include
++ * it near the beginning of the standard driver.
++ *
++ * This is imported in two places, hence the conditional at the
++ * beginning.
++ */
++
++
++#include "../xennet_common.h"
++
++DEFINE_PER_CPU_READ_MOSTLY(int, busy_wait_cnt);
++uint64_t i40e_busy_wait_limit = 0;
++
++static inline uint32_t
++ring_diff(unsigned int old, unsigned int new, unsigned int num_slots)
++{
++        int ret = new - old;
++        if (ret < 0)
++                ret += num_slots;
++        return ret;
++}
++
++/*
++#define build_mmio_write(name, size, type, reg, barrier) \
++static inline void name(type val, volatile void __iomem *addr) \
++{ asm volatile("mov" size " %0,%1": :reg (val), \
++"m" (*(volatile type __force *)addr) barrier); }
++
++build_mmio_write(__writel, "l", unsigned int, "r", )
++#define __raw_writel __writel
++*/
++
++int ix_rx_miss = 0, ix_rx_miss_bufs = 0, ix_crcstrip = 1;
++
++#define BIT(nr)                 (1UL << (nr))
++#define BIT_ULL(nr)		(1ULL << (nr))
++#define I40E_MASK(mask, shift) (mask << shift)
++#define ITR_TO_REG(setting) ((setting & ~I40E_ITR_DYNAMIC) >> 1)
++#define INTRL_ENA                  BIT(6)
++#define INTRL_USEC_TO_REG(set) ((set) ? ((set) >> 2) | INTRL_ENA : 0)
++#include "i40e_register.h"
++
++#define i40e_flush(a)	    readl((a)->hwif.hw_addr + I40E_GLGEN_STAT)
++
++#define I40E_HWINFO(nmif, ring_id) (&((struct i40e_hwinfo *) nmif->hwif.hwinfo)[ring_id])
++#define I40E_TX_DESC(nmif, ring_id, nic_i) (&((struct i40e_tx_desc *) (I40E_HWINFO(nmif, ring_id))->xen_tx_desc)[nic_i])
++#define I40E_RX_DESC(nmif, ring_id, nic_i) (&((union i40e_rx_desc *) (I40E_HWINFO(nmif, ring_id))->xen_rx_desc)[nic_i])
++
++#define I40E_TXD_QW1_CMD_SHIFT	4
++#define I40E_TXD_QW1_TX_BUF_SZ_SHIFT	34
++
++#define I40E_RXD_QW1_STATUS_SHIFT	0
++#define I40E_RXD_QW1_STATUS_MASK	((BIT(I40E_RX_DESC_STATUS_LAST) - 1) \
++					 << I40E_RXD_QW1_STATUS_SHIFT)
++
++#define I40E_RXD_QW1_LENGTH_PBUF_SHIFT	38
++#define I40E_RXD_QW1_LENGTH_PBUF_MASK	(0x3FFFULL << \
++					 I40E_RXD_QW1_LENGTH_PBUF_SHIFT)
++
++enum i40e_state_t {
++	__I40E_TESTING,
++	__I40E_CONFIG_BUSY,
++	__I40E_CONFIG_DONE,
++	__I40E_DOWN,
++	__I40E_NEEDS_RESTART,
++	__I40E_SERVICE_SCHED,
++	__I40E_ADMINQ_EVENT_PENDING,
++	__I40E_MDD_EVENT_PENDING,
++	__I40E_VFLR_EVENT_PENDING,
++	__I40E_RESET_RECOVERY_PENDING,
++	__I40E_RESET_INTR_RECEIVED,
++	__I40E_REINIT_REQUESTED,
++	__I40E_PF_RESET_REQUESTED,
++	__I40E_CORE_RESET_REQUESTED,
++	__I40E_GLOBAL_RESET_REQUESTED,
++	__I40E_EMP_RESET_REQUESTED,
++	__I40E_EMP_RESET_INTR_RECEIVED,
++	__I40E_FILTER_OVERFLOW_PROMISC,
++	__I40E_SUSPENDED,
++	__I40E_PTP_TX_IN_PROGRESS,
++	__I40E_BAD_EEPROM,
++	__I40E_DOWN_REQUESTED,
++	__I40E_FD_FLUSH_REQUESTED,
++	__I40E_RESET_FAILED,
++	__I40E_PORT_TX_SUSPENDED,
++	__I40E_VF_DISABLE,
++};
++
++enum i40e_tx_desc_cmd_bits {
++	I40E_TX_DESC_CMD_EOP			= 0x0001,
++	I40E_TX_DESC_CMD_RS			= 0x0002,
++	I40E_TX_DESC_CMD_ICRC			= 0x0004,
++	I40E_TX_DESC_CMD_IL2TAG1		= 0x0008,
++	I40E_TX_DESC_CMD_DUMMY			= 0x0010,
++	I40E_TX_DESC_CMD_IIPT_NONIP		= 0x0000, /* 2 BITS */
++	I40E_TX_DESC_CMD_IIPT_IPV6		= 0x0020, /* 2 BITS */
++	I40E_TX_DESC_CMD_IIPT_IPV4		= 0x0040, /* 2 BITS */
++	I40E_TX_DESC_CMD_IIPT_IPV4_CSUM		= 0x0060, /* 2 BITS */
++	I40E_TX_DESC_CMD_FCOET			= 0x0080,
++	I40E_TX_DESC_CMD_L4T_EOFT_UNK		= 0x0000, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_TCP		= 0x0100, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_SCTP		= 0x0200, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_UDP		= 0x0300, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_EOF_N		= 0x0000, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_EOF_T		= 0x0100, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_EOF_NI	= 0x0200, /* 2 BITS */
++	I40E_TX_DESC_CMD_L4T_EOFT_EOF_A		= 0x0300, /* 2 BITS */
++};
++
++union i40e_32byte_rx_desc {
++	struct {
++		__le64  pkt_addr; /* Packet buffer address */
++		__le64  hdr_addr; /* Header buffer address */
++			/* bit 0 of hdr_buffer_addr is DD bit */
++		__le64  rsvd1;
++		__le64  rsvd2;
++	} read;
++	struct {
++		struct {
++			struct {
++				union {
++					__le16 mirroring_status;
++					__le16 fcoe_ctx_id;
++				} mirr_fcoe;
++				__le16 l2tag1;
++			} lo_dword;
++			union {
++				__le32 rss; /* RSS Hash */
++				__le32 fcoe_param; /* FCoE DDP Context id */
++				/* Flow director filter id in case of
++				 * Programming status desc WB
++				 */
++				__le32 fd_id;
++			} hi_dword;
++		} qword0;
++		struct {
++			/* status/error/pktype/length */
++			__le64 status_error_len;
++		} qword1;
++		struct {
++			__le16 ext_status; /* extended status */
++			__le16 rsvd;
++			__le16 l2tag2_1;
++			__le16 l2tag2_2;
++		} qword2;
++		struct {
++			union {
++				__le32 flex_bytes_lo;
++				__le32 pe_status;
++			} lo_dword;
++			union {
++				__le32 flex_bytes_hi;
++				__le32 fd_id;
++			} hi_dword;
++		} qword3;
++	} wb;  /* writeback */
++};
++
++#define i40e_rx_desc i40e_32byte_rx_desc
++
++enum i40e_rx_desc_status_bits {
++	/* Note: These are predefined bit offsets */
++	I40E_RX_DESC_STATUS_DD_SHIFT		= 0,
++	I40E_RX_DESC_STATUS_EOF_SHIFT		= 1,
++	I40E_RX_DESC_STATUS_L2TAG1P_SHIFT	= 2,
++	I40E_RX_DESC_STATUS_L3L4P_SHIFT		= 3,
++	I40E_RX_DESC_STATUS_CRCP_SHIFT		= 4,
++	I40E_RX_DESC_STATUS_TSYNINDX_SHIFT	= 5, /* 2 BITS */
++	I40E_RX_DESC_STATUS_TSYNVALID_SHIFT	= 7,
++	/* Note: Bit 8 is reserved in X710 and XL710 */
++	I40E_RX_DESC_STATUS_EXT_UDP_0_SHIFT	= 8,
++	I40E_RX_DESC_STATUS_UMBCAST_SHIFT	= 9, /* 2 BITS */
++	I40E_RX_DESC_STATUS_FLM_SHIFT		= 11,
++	I40E_RX_DESC_STATUS_FLTSTAT_SHIFT	= 12, /* 2 BITS */
++	I40E_RX_DESC_STATUS_LPBK_SHIFT		= 14,
++	I40E_RX_DESC_STATUS_IPV6EXADD_SHIFT	= 15,
++	I40E_RX_DESC_STATUS_RESERVED_SHIFT	= 16, /* 2 BITS */
++	/* Note: For non-tunnel packets INT_UDP_0 is the right status for
++	 * UDP header
++	 */
++	I40E_RX_DESC_STATUS_INT_UDP_0_SHIFT	= 18,
++	I40E_RX_DESC_STATUS_LAST /* this entry must be last!!! */
++};
++
++enum i40e_latency_range {
++	I40E_LOWEST_LATENCY = 0,
++	I40E_LOW_LATENCY = 1,
++	I40E_BULK_LATENCY = 2,
++	I40E_ULTRA_LATENCY = 3,
++};
++
++struct i40e_ring;
++
++struct i40e_ring_container {
++	/* array of pointers to rings */
++	struct i40e_ring *ring;
++	unsigned int total_bytes;	/* total bytes processed this int */
++	unsigned int total_packets;	/* total packets processed this int */
++	u16 count;
++	enum i40e_latency_range latency_range;
++	u16 itr;
++};
++
++struct i40e_hwinfo {
++	void *xen_tx_desc;
++	void *xen_rx_desc;
++	u16 *base_queue;
++	u16 *queue_index;
++	u32 *base_vector;
++	u32 *hung_detected;
++	u32 *state;
++	u64 *flags;
++	u16 pf_q;
++	u16 ring_id;
++	struct netmapif *nmif;
++	struct i40e_ring_container *tx_rc;
++	struct i40e_ring_container *rx_rc;
++};
++
++struct i40e_tx_desc {
++	__le64 buffer_addr; /* Address of descriptor's data buf */
++	__le64 cmd_type_offset_bsz;
++};
++
++struct i40e_queue_stats {
++	u64 packets;
++	u64 bytes;
++};
++
++struct i40e_ring {
++	struct i40e_ring *next;		/* pointer to next ring in q_vector */
++	void *desc;			/* Descriptor ring memory */
++	void *dev; //struct device *dev;		/* Used for DMA mapping */
++	void *netdev; //struct net_device *netdev;	/* netdev ring maps to */
++	union {
++		void *tx_bi; // struct i40e_tx_buffer *tx_bi;
++		void *rx_bi; // struct i40e_rx_buffer *rx_bi;
++	};
++	unsigned long state;
++	u16 queue_index;		/* Queue number of ring */
++	u8 dcb_tc;			/* Traffic class of ring */
++	u8 __iomem *tail;
++
++	/* high bit set means dynamic, use accessor routines to read/write.
++	 * hardware only supports 2us resolution for the ITR registers.
++	 * these values always store the USER setting, and must be converted
++	 * before programming to a register.
++	 */
++	u16 rx_itr_setting;
++	u16 tx_itr_setting;
++
++	u16 count;			/* Number of descriptors */
++	u16 reg_idx;			/* HW register index of the ring */
++	u16 rx_hdr_len;
++	u16 rx_buf_len;
++	u8  dtype;
++#define I40E_RX_DTYPE_NO_SPLIT      0
++#define I40E_RX_DTYPE_HEADER_SPLIT  1
++#define I40E_RX_DTYPE_SPLIT_ALWAYS  2
++#define I40E_RX_SPLIT_L2      0x1
++#define I40E_RX_SPLIT_IP      0x2
++#define I40E_RX_SPLIT_TCP_UDP 0x4
++#define I40E_RX_SPLIT_SCTP    0x8
++
++	/* used in interrupt processing */
++	u16 next_to_use;
++	u16 next_to_clean;
++
++	u8 atr_sample_rate;
++	u8 atr_count;
++
++	unsigned long last_rx_timestamp;
++
++	bool_t ring_active;		/* is ring online or not */
++	bool_t arm_wb;		/* do something to arm write back */
++	u8 packet_stride;
++
++	u16 flags;
++#define I40E_TXR_FLAGS_WB_ON_ITR	BIT(0)
++#define I40E_TXR_FLAGS_LAST_XMIT_MORE_SET BIT(2)
++
++	/* stats structs */
++//	struct i40e_queue_stats	stats;
++//	struct u64_stats_sync syncp;
++//	union {
++//		struct i40e_tx_queue_stats tx_stats;
++//		struct i40e_rx_queue_stats rx_stats;
++//	};
++//
++//	unsigned int size;		/* length of descriptor ring in bytes */
++//	dma_addr_t dma;			/* physical address of ring */
++//
++//	struct i40e_vsi *vsi;		/* Backreference to associated VSI */
++//	struct i40e_q_vector *q_vector;	/* Backreference to associated vector */
++//
++//	struct rcu_head rcu;		/* to avoid race on free */
++} ____cacheline_internodealigned_in_smp;
++
++
++/*
++ * Reconcile kernel and user view of the transmit ring.
++ *
++ * All information is in the kring.
++ * Userspace wants to send packets up to the one before kring->rhead,
++ * kernel knows kring->nr_hwcur is the first unsent packet.
++ *
++ * Here we push packets out (as many as possible), and possibly
++ * reclaim buffers from previously completed transmission.
++ *
++ * The caller (netmap) guarantees that there is only one instance
++ * running at any time. Any interference with other driver
++ * methods should be handled by the individual drivers.
++ */
++
++static inline u_int
++i40e_netmap_read_hwtail(void *base, int nslots)
++{
++	struct i40e_tx_desc *desc = base;
++	return le32toh(*(volatile __le32 *)&desc[nslots]);
++}
++
++int
++i40e_netmap_txsync(struct netmap_kring *kring, int flags)
++{
++	struct netmapif *nmif = kring->nmif;
++	struct netmap_ring *ring = kring->xen_ring;
++	u_int nm_i;	/* index into the netmap ring */
++	u_int nic_i;	/* index into the NIC ring */
++	u_int n;
++	u_int const lim = kring->nkr_num_slots - 1;
++	u_int const head = kring->rhead;
++	struct i40e_hwinfo *hwinfo = &((struct i40e_hwinfo *) nmif->hwif.hwinfo)[kring->ring_id];
++	/*
++	 * interrupts on every tx packet are expensive so request
++	 * them every half ring, or where NS_REPORT is set
++	 */
++	u_int report_frequency = kring->nkr_num_slots >> 1;
++
++	/* device-specific */
++	struct i40e_ring *txr;
++	//if (!netif_running(ifp))
++	//	return 0;
++
++	if (drvdom_txsync) {
++		xennet_netmap_notify(kring, flags);
++		return 0;
++	}
++
++	txr = nmif->hwif.hw_tx_rings[kring->ring_id];
++	if (unlikely(!txr)) {
++		XD("there is no tx ring %d", kring->ring_id);
++		return ENXIO;
++	}
++
++	//bus_dmamap_sync(txr->dma.tag, txr->dma.map,
++	//		BUS_DMASYNC_POSTREAD);
++
++	/*
++	 * First part: process new packets to send.
++	 * nm_i is the current index in the netmap ring,
++	 * nic_i is the corresponding index in the NIC ring.
++	 * The two numbers differ because upon a *_init() we reset
++	 * the NIC ring but leave the netmap ring unchanged.
++	 * For the transmit ring, we have
++	 *
++	 *		nm_i = kring->nr_hwcur
++	 *		nic_i = IXGBE_TDT (not tracked in the driver)
++	 * and
++	 * 		nm_i == (nic_i + kring->nkr_hwofs) % ring_size
++	 *
++	 * In this driver kring->nkr_hwofs >= 0, but for other
++	 * drivers it might be negative as well.
++	 */
++
++	/*
++	 * If we have packets to send (kring->nr_hwcur != kring->rhead)
++	 * iterate over the netmap ring, fetch length and update
++	 * the corresponding slot in the NIC ring. Some drivers also
++	 * need to update the buffer's physical address in the NIC slot
++	 * even NS_BUF_CHANGED is not set (PNMB computes the addresses).
++	 *
++	 * The netmap_reload_map() calls is especially expensive,
++	 * even when (as in this case) the tag is 0, so do only
++	 * when the buffer has actually changed.
++	 *
++	 * If possible do not set the report/intr bit on all slots,
++	 * but only a few times per ring or when NS_REPORT is set.
++	 *
++	 * Finally, on 10G and faster drivers, it might be useful
++	 * to prefetch the next slot and txr entry.
++	 */
++
++	nm_i = kring->nr_hwcur;
++	if (nm_i != head) {	/* we have new packets to send */
++		nic_i = netmap_idx_k2n(kring, nm_i);
++
++		__builtin_prefetch(&ring->slot[nm_i]);
++		__builtin_prefetch(I40E_TX_DESC(nmif, kring->ring_id, nic_i));
++
++		for (n = 0; nm_i != head; n++) {
++			struct netmap_slot *slot = &ring->slot[nm_i];
++			u_int len = slot->len;
++			uint64_t paddr;
++			struct i40e_tx_desc *curr;
++			//void *addr = PNMB(na, slot, &paddr);
++
++			/* device-specific */
++			u64 flags = (slot->flags & NS_REPORT ||
++				nic_i == 0 || nic_i == report_frequency) ?
++				((u64)I40E_TX_DESC_CMD_RS << I40E_TXD_QW1_CMD_SHIFT) : 0;
++			PNMB(nmif, slot, &paddr);
++			curr = &((struct i40e_tx_desc *) hwinfo->xen_tx_desc)[nic_i];
++
++			/* prefetch for next round */
++			__builtin_prefetch(&ring->slot[nm_i + 1]);
++			__builtin_prefetch(I40E_TX_DESC(nmif, kring->ring_id, nic_i));
++
++			NM_CHECK_ADDR_LEN(nmif, addr, len);
++
++			if (slot->flags & NS_BUF_CHANGED) {
++				/* buffer has changed, reload map */
++				//netmap_reload_map(na, txr->dma.tag, txbuf->map, addr);
++			}
++			slot->flags &= ~(NS_REPORT | NS_BUF_CHANGED);
++
++			/* Fill the slot in the NIC ring. */
++			/* Use legacy descriptor, they are faster? */
++			curr->buffer_addr = htole64(paddr);
++			curr->cmd_type_offset_bsz = htole64(
++			    ((u64)len << I40E_TXD_QW1_TX_BUF_SZ_SHIFT) |
++			    flags |
++			    ((u64)(I40E_TX_DESC_CMD_ICRC | I40E_TX_DESC_CMD_EOP) << I40E_TXD_QW1_CMD_SHIFT)
++			  ); // XXX more ?
++
++			nm_i = nm_next(nm_i, lim);
++			nic_i = nm_next(nic_i, lim);
++		}
++		kring->nr_hwcur = head;
++
++		/* synchronize the NIC ring */
++		//bus_dmamap_sync(txr->dma.tag, txr->dma.map,
++		//	BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++
++		/* (re)start the tx unit up to slot nic_i (excluded) */
++		wmb();
++		//writel(nic_i, txr->tail);
++		writel(nic_i, nmif->hwif.hw_addr
++			+ I40E_QTX_TAIL(((struct i40e_hwinfo *)(nmif->hwif.hwinfo))[kring->ring_id].pf_q));
++	}
++
++	/*
++	 * Second part: reclaim buffers for completed transmissions.
++	 */
++	nic_i = i40e_netmap_read_hwtail(I40E_TX_DESC(nmif, kring->ring_id, 0), kring->nkr_num_slots);
++	if (nic_i != txr->next_to_clean) {
++		/* some tx completed, increment avail */
++		txr->next_to_clean = nic_i;
++		kring->nr_hwtail = nm_prev(netmap_idx_n2k(kring, nic_i), lim);
++	}
++
++	per_cpu(busy_wait_cnt, hwinfo->ring_id) = i40e_busy_wait_limit;
++
++	return 0;
++}
++
++static int netmap_no_pendintr = 0;
++
++int
++i40e_netmap_rxsync(struct netmap_kring *kring, int flags)
++{
++	struct netmapif *nmif = kring->nmif;
++	struct netmap_ring *ring = kring->xen_ring;
++	u_int nm_i;	/* index into the netmap ring */
++	u_int nic_i;	/* index into the NIC ring */
++	u_int n;
++	u_int const lim = kring->nkr_num_slots - 1;
++	u_int const head = kring->rhead;
++	int force_update = (flags & NAF_FORCE_READ) || kring->nr_kflags & NKR_PENDINTR;
++
++	/* device-specific */
++	//struct i40e_netdev_priv *np = netdev_priv(ifp);
++	//struct i40e_vsi *vsi = np->vsi;
++	struct i40e_ring *rxr;
++
++	//if (!netif_running(ifp))
++	//	return 0;
++
++	rxr = nmif->hwif.hw_rx_rings[kring->ring_id];
++	if (!rxr)
++		return ENXIO;
++
++	if (head > lim)
++		return netmap_ring_reinit(kring);
++
++	/* XXX check sync modes */
++	//bus_dmamap_sync(rxr->dma.tag, rxr->dma.map,
++	//		BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
++
++	/*
++	 * First part: import newly received packets.
++	 *
++	 * nm_i is the index of the next free slot in the netmap ring,
++	 * nic_i is the index of the next received packet in the NIC ring,
++	 * and they may differ in case if_init() has been called while
++	 * in netmap mode. For the receive ring we have
++	 *
++	 *	nic_i = rxr->next_check;
++	 *	nm_i = kring->nr_hwtail (previous)
++	 * and
++	 *	nm_i == (nic_i + kring->nkr_hwofs) % ring_size
++	 *
++	 * rxr->next_check is set to 0 on a ring reinit
++	 */
++	if (netmap_no_pendintr || force_update) {
++		int crclen = ix_crcstrip ? 0 : 4;
++		uint16_t slot_flags = kring->nkr_slot_flags;
++
++		nic_i = rxr->next_to_clean; // or also k2n(kring->nr_hwtail)
++		nm_i = netmap_idx_n2k(kring, nic_i);
++
++		for (n = 0; ; n++) {
++			union i40e_rx_desc *curr = I40E_RX_DESC(nmif, kring->ring_id, nic_i);
++			uint64_t qword = le64toh(curr->wb.qword1.status_error_len);
++			uint32_t staterr = (qword & I40E_RXD_QW1_STATUS_MASK)
++				 >> I40E_RXD_QW1_STATUS_SHIFT;
++
++			if ((staterr & (1<<I40E_RX_DESC_STATUS_DD_SHIFT)) == 0) {
++				break;
++			}
++			ring->slot[nm_i].len = ((qword & I40E_RXD_QW1_LENGTH_PBUF_MASK)
++			    >> I40E_RXD_QW1_LENGTH_PBUF_SHIFT) - crclen;
++			ring->slot[nm_i].flags = slot_flags;
++			//bus_dmamap_sync(rxr->ptag,
++			//    rxr->buffers[nic_i].pmap, BUS_DMASYNC_POSTREAD);
++			nm_i = nm_next(nm_i, lim);
++			nic_i = nm_next(nic_i, lim);
++		}
++		if (n) { /* update the state variables */
++			if (netmap_no_pendintr && !force_update) {
++				/* diagnostics */
++				ix_rx_miss ++;
++				ix_rx_miss_bufs += n;
++			}
++			rxr->next_to_clean = nic_i;
++			kring->nr_hwtail = nm_i;
++		}
++		kring->nr_kflags &= ~NKR_PENDINTR;
++	}
++
++	/*
++	 * Second part: skip past packets that userspace has released.
++	 * (kring->nr_hwcur to kring->rhead excluded),
++	 * and make the buffers available for reception.
++	 * As usual nm_i is the index in the netmap ring,
++	 * nic_i is the index in the NIC ring, and
++	 * nm_i == (nic_i + kring->nkr_hwofs) % ring_size
++	 */
++	nm_i = kring->nr_hwcur;
++	if (nm_i != head) {
++		nic_i = netmap_idx_k2n(kring, nm_i);
++		for (n = 0; nm_i != head; n++) {
++			struct netmap_slot *slot = &ring->slot[nm_i];
++			uint64_t paddr;
++			void *addr;
++
++			union i40e_32byte_rx_desc *curr = I40E_RX_DESC(nmif, kring->ring_id, nic_i);
++
++			addr = PNMB(nmif, slot, &paddr);
++			//if (addr == NETMAP_BUF_BASE(na)) /* bad buf */
++			//	goto ring_reset;
++
++			if (slot->flags & NS_BUF_CHANGED) {
++				/* buffer has changed, reload map */
++				//netmap_reload_map(na, rxr->ptag, rxbuf->pmap, addr);
++				slot->flags &= ~NS_BUF_CHANGED;
++			}
++			curr->read.pkt_addr = htole64(paddr);
++			curr->read.hdr_addr = 0; // XXX needed
++			//bus_dmamap_sync(rxr->ptag, rxbuf->pmap,
++			//    BUS_DMASYNC_PREREAD);
++			nm_i = nm_next(nm_i, lim);
++			nic_i = nm_next(nic_i, lim);
++		}
++		kring->nr_hwcur = head;
++
++		//bus_dmamap_sync(rxr->dma.tag, rxr->dma.map,
++		//    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++		/*
++		 * IMPORTANT: we must leave one free slot in the ring,
++		 * so move nic_i back by one unit
++		 */
++		nic_i = nm_prev(nic_i, lim);
++		wmb();
++		writel(nic_i, nmif->hwif.hw_addr
++			+ I40E_QRX_TAIL(((struct i40e_hwinfo *)(nmif->hwif.hwinfo))[kring->ring_id].pf_q));
++	}
++
++	return 0;
++
++//ring_reset:
++//	return netmap_ring_reinit(kring);
++}
++
++int unmap_i40e_hwobj(xennet_mem_op_t *op, struct netmapif *nmif)
++{
++	struct hwif *hwif = &nmif->hwif;
++	struct i40e_hwinfo *hwinfo;
++	int i;
++
++	if (!hwif) {
++		XD("no hwif, skip");
++		return -EINVAL;
++	}
++
++	if (!hwif->hwinfo) {
++		XD("no hwinfo");
++		return 0;
++	}
++
++#define IOUNMAP_OBJ(objname) \
++	do {							\
++		iounmap(hwinfo->objname);			\
++		hwinfo->objname = NULL;				\
++	} while (0)
++#define VUNMAP_OBJ(objname) \
++	do {							\
++		vunmap_addr((unsigned long) hwinfo->objname);	\
++		hwinfo->objname = NULL;				\
++	} while (0)
++
++	for (i = 0; i < nmif->num_tx_rings; i++) {
++		hwinfo = &(((struct i40e_hwinfo *) hwif->hwinfo))[i];
++		if (hwinfo->xen_tx_desc)
++			IOUNMAP_OBJ(xen_tx_desc);
++		if (hwinfo->xen_rx_desc)
++			IOUNMAP_OBJ(xen_rx_desc);
++		if (hwinfo->base_queue)
++			VUNMAP_OBJ(base_queue);
++		if (hwinfo->queue_index)
++			VUNMAP_OBJ(queue_index);
++		if (hwinfo->base_vector)
++			VUNMAP_OBJ(base_vector);
++		if (hwinfo->hung_detected)
++			VUNMAP_OBJ(hung_detected);
++		if (hwinfo->state)
++			VUNMAP_OBJ(state);
++		if (hwinfo->flags)
++			VUNMAP_OBJ(flags);
++		if (hwinfo->tx_rc)
++			VUNMAP_OBJ(tx_rc);
++		if (hwinfo->rx_rc)
++			VUNMAP_OBJ(rx_rc);
++	}
++#undef VUNMAP_OBJ
++
++	xfree(hwif->hwinfo);
++	hwif->hwinfo = NULL;
++
++	return 0;
++}
++
++int unmap_i40e(xennet_mem_op_t *op, struct netmapif *nmif)
++{
++	struct hwif *hwif = &nmif->hwif;
++	int i;
++
++	if (!hwif) {
++		XD("no hwif, skip");
++		return -EINVAL;
++	}
++
++	if (hwif->hwinfo) {
++		unmap_i40e_hwobj(op, nmif);
++	}
++
++#define VUNMAP_OBJ(objname) \
++	do {						    \
++		vunmap_addr((unsigned long) hwif->objname); \
++		hwif->objname = NULL;			    \
++	} while (0)
++
++#define VUNMAP_OBJ_RING(objname, id) \
++	do {							\
++		vunmap_addr((unsigned long) hwif->objname[id]);	\
++		hwif->objname[i] = NULL;			\
++	} while (0)
++
++
++	if (hwif->hw_tx_rings) {
++		for (i = 0; i < nmif->num_tx_rings; i++) {
++			VUNMAP_OBJ_RING(hw_tx_rings, i);
++		}
++		xfree(hwif->hw_tx_rings);
++		hwif->hw_tx_rings = NULL;
++	}
++	if (hwif->hw_rx_rings) {
++		for (i = 0; i < nmif->num_rx_rings; i++) {
++			VUNMAP_OBJ_RING(hw_rx_rings, i);
++		}
++		xfree(hwif->hw_rx_rings);
++		hwif->hw_rx_rings = NULL;
++	}
++	VUNMAP_OBJ(hw_addr);
++#undef VUNMAP_OBJ
++#undef VUNMAP_OBJ_TXRING
++
++	return 0;
++}
++
++static struct i40e_hwinfo *hwinfo_alloc(struct netmapif *nmif, int num_rings)
++{
++	int i;
++	struct i40e_hwinfo *hwinfo = xzalloc_array(struct i40e_hwinfo, num_rings);
++	if (!hwinfo) {
++		XD("failed to alloc hwinfo");
++		return NULL;
++	}
++	for (i = 0; i < num_rings; i++) {
++		hwinfo[i].ring_id = i;
++		hwinfo[i].nmif = nmif;
++	}
++	return hwinfo;
++}
++
++int map_i40e_hwobj(xennet_mem_op_t *op, struct netmapif *nmif)
++{
++	struct hwif *hwif = &nmif->hwif;
++	struct i40e_hwinfo *hwinfo;
++	void *objptr;
++	int ret = 0;
++
++	if (!hwif) {
++		XD("no hwif, skip");
++		return -EINVAL;
++	}
++
++	if (op->id2 < 0 || op->id2 >= nmif->num_tx_rings) {
++		XD("Invalid ring_id %d, max %d", op->id2, nmif->num_tx_rings);
++		return -EINVAL;
++	}
++
++	if (nmif->num_tx_rings != nmif->num_rx_rings) {
++		XD("We don't support asynmetric TX/RX rings TX:%d RX:%d",
++				nmif->num_tx_rings,
++				nmif->num_rx_rings);
++		return -EINVAL;
++	}
++
++	if (!hwif->hwinfo) {
++		hwif->hwinfo = hwinfo_alloc(nmif, nmif->num_tx_rings);
++		if (!hwif->hwinfo) {
++			XD("Failed to alloc hwinfo");
++			return -ENOMEM;
++		}
++	}
++
++	hwinfo = &((struct i40e_hwinfo *) hwif->hwinfo)[op->id2];
++
++	objptr = network_map_frames(op) + op->pgoff;
++	if (IS_ERR(objptr)) {
++		XD("failed to map objoff");
++		ret = PTR_ERR(objptr);
++		goto out;
++	}
++
++#define SET_VAL(objname, type) \
++	if (op->objoff == offsetof(struct i40e_hwinfo, objname)) {	\
++		((type *) hwinfo)->objname = objptr;			\
++		ND("set val %s", ""#objname"");				\
++		goto out;						\
++	}
++
++	SET_VAL(xen_tx_desc, struct i40e_hwinfo);
++	SET_VAL(xen_rx_desc, struct i40e_hwinfo);
++	SET_VAL(tx_rc, struct i40e_hwinfo);
++	SET_VAL(rx_rc, struct i40e_hwinfo);
++	SET_VAL(base_queue, struct i40e_hwinfo);
++	SET_VAL(queue_index, struct i40e_hwinfo);
++	SET_VAL(base_vector, struct i40e_hwinfo);
++	SET_VAL(hung_detected, struct i40e_hwinfo);
++	SET_VAL(state, struct i40e_hwinfo);
++	SET_VAL(flags, struct i40e_hwinfo);
++#undef SET_VAL
++	ret = -EINVAL;
++out:
++
++	if (op->objoff == offsetof(struct i40e_hwinfo, base_queue)
++			|| op->objoff == offsetof(struct i40e_hwinfo, queue_index)) {
++		if ((((struct i40e_hwinfo *)(nmif->hwif.hwinfo))[op->id2].base_queue) != NULL
++				&& (((struct i40e_hwinfo *)(nmif->hwif.hwinfo))[op->id2].queue_index) != NULL) {
++			((struct i40e_hwinfo*) hwinfo)->pf_q = *(((struct i40e_hwinfo *)(nmif->hwif.hwinfo))[op->id2].base_queue)
++									+ *(((struct i40e_hwinfo *)(nmif->hwif.hwinfo))[op->id2].queue_index);
++		}
++	}
++	return ret;
++}
++
++int map_i40e(xennet_mem_op_t *op, struct netmapif *nmif)
++{
++	struct hwif *hwif = &nmif->hwif;
++	void *objptr;
++	int ret = 0;
++
++	if (!hwif) {
++		XD("no hwif, skip");
++		return -EINVAL;
++	}
++
++	if (!hwif->hw_tx_rings) {
++		hwif->hw_tx_rings = (void **) xzalloc_array(struct i40e_ring *, nmif->num_tx_rings);
++		if (!hwif->hw_tx_rings) {
++			XD("failed to alloc hw_tx_rings");
++			return -ENOMEM;
++		}
++	}
++
++	if (!hwif->hw_rx_rings) {
++		hwif->hw_rx_rings = (void **) xzalloc_array(struct i40e_ring *, nmif->num_rx_rings);
++		if (!hwif->hw_rx_rings) {
++			XD("failed to alloc hw_rx_rings");
++			return -ENOMEM;
++		}
++	}
++
++	if (op->objoff == offsetof(struct hwif, hw_addr)) {
++		objptr = network_iomem_map_frames(op) + op->pgoff;
++		if (IS_ERR(objptr)) {
++			XD("failed to map objoff");
++			ret = PTR_ERR(objptr);
++			goto out;
++		}
++		ND("set val hw_addr");
++		hwif->hw_addr = objptr;
++		goto out;
++	}
++
++	objptr = network_map_frames(op) + op->pgoff;
++	if (IS_ERR(objptr)) {
++		XD("failed to map objoff");
++		ret = PTR_ERR(objptr);
++		goto out;
++	}
++
++#define SET_VAL_RING(objname, ring_id) \
++	if (op->objoff == offsetof(struct hwif, objname)) {		\
++		hwif->objname[ring_id] = objptr;			\
++		ND("set val %s[%d]", ""#objname"", ring_id);		\
++		goto out;						\
++	}
++
++	SET_VAL_RING(hw_tx_rings, op->id2);
++	SET_VAL_RING(hw_rx_rings, op->id2);
++#undef SET_VAL_RING
++
++	XD("no such object");
++	ret = -EINVAL;
++out:
++	return ret;
++}
++
++/* end of file */
+-- 
+2.7.4
+

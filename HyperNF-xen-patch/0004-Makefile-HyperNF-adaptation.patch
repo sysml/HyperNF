@@ -1,0 +1,40 @@
+From deda021ea00e443667d6a18ff51374fe1f192ad3 Mon Sep 17 00:00:00 2001
+From: Kenichi Yasukata <kenichi.yasukata@neclab.eu>
+Date: Wed, 9 Aug 2017 13:32:34 +0100
+Subject: [PATCH 4/7] Makefile: HyperNF adaptation
+
+---
+ xen/Rules.mk        | 2 +-
+ xen/common/Makefile | 3 +++
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/xen/Rules.mk b/xen/Rules.mk
+index 0f2658d..a3fe501 100644
+--- a/xen/Rules.mk
++++ b/xen/Rules.mk
+@@ -57,7 +57,7 @@ CFLAGS += -Werror -Wredundant-decls -Wno-pointer-arith
+ CFLAGS += -pipe -g -D__XEN__ -include $(BASEDIR)/include/xen/config.h
+ CFLAGS += '-D__OBJECT_FILE__="$@"'
+ 
+-NETMAP_SRC ?= $(realpath ../netmap)
++NETMAP_SRC ?= $(realpath $(XEN_ROOT)/../netmap)
+ CFLAGS += -I$(NETMAP_SRC)/sys -I$(NETMAP_SRC)/LINUX
+ 
+ ifneq ($(clang),y)
+diff --git a/xen/common/Makefile b/xen/common/Makefile
+index 0fed30b..8265b13 100644
+--- a/xen/common/Makefile
++++ b/xen/common/Makefile
+@@ -61,6 +61,9 @@ obj-y += vmap.o
+ obj-y += vsprintf.o
+ obj-y += wait.o
+ obj-bin-y += warning.init.o
++obj-y += xennet/network.o
++obj-y += xennet/vale.o
++obj-y += xennet/i40e/i40e_netmap_linux.o
+ obj-$(CONFIG_XENOPROF) += xenoprof.o
+ obj-y += xmalloc_tlsf.o
+ 
+-- 
+2.7.4
+
